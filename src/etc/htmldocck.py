@@ -114,7 +114,10 @@ try:
     from html.parser import HTMLParser
 except ImportError:
     from HTMLParser import HTMLParser
-from xml.etree import cElementTree as ET
+try:
+    from xml.etree import cElementTree as ET
+except ImportError:
+    from xml.etree import ElementTree as ET
 
 try:
     from html.entities import name2codepoint
@@ -122,8 +125,8 @@ except ImportError:
     from htmlentitydefs import name2codepoint
 
 # "void elements" (no closing tag) from the HTML Standard section 12.1.2
-VOID_ELEMENTS = set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'keygen',
-                     'link', 'menuitem', 'meta', 'param', 'source', 'track', 'wbr'])
+VOID_ELEMENTS = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'keygen',
+                     'link', 'menuitem', 'meta', 'param', 'source', 'track', 'wbr'}
 
 # Python 2 -> 3 compatibility
 try:
@@ -131,6 +134,8 @@ try:
 except NameError:
     unichr = chr
 
+
+channel = os.environ["DOC_RUST_LANG_ORG_CHANNEL"]
 
 class CustomHTMLParser(HTMLParser):
     """simplified HTML parser.
@@ -143,7 +148,7 @@ class CustomHTMLParser(HTMLParser):
         self.__builder = target or ET.TreeBuilder()
 
     def handle_starttag(self, tag, attrs):
-        attrs = dict((k, v or '') for k, v in attrs)
+        attrs = {k: v or '' for k, v in attrs}
         self.__builder.start(tag, attrs)
         if tag in VOID_ELEMENTS:
             self.__builder.end(tag)
@@ -152,7 +157,7 @@ class CustomHTMLParser(HTMLParser):
         self.__builder.end(tag)
 
     def handle_startendtag(self, tag, attrs):
-        attrs = dict((k, v or '') for k, v in attrs)
+        attrs = {k: v or '' for k, v in attrs}
         self.__builder.start(tag, attrs)
         self.__builder.end(tag)
 
@@ -215,7 +220,7 @@ def concat_multi_lines(f):
 
 
 LINE_PATTERN = re.compile(r'''
-    (?<=(?<!\S)@)(?P<negated>!?)
+    (?<=(?<!\S))(?P<invalid>!?)@(?P<negated>!?)
     (?P<cmd>[A-Za-z]+(?:-[A-Za-z]+)*)
     (?P<args>.*)$
 ''', re.X | re.UNICODE)
@@ -230,6 +235,16 @@ def get_commands(template):
 
             negated = (m.group('negated') == '!')
             cmd = m.group('cmd')
+            if m.group('invalid') == '!':
+                print_err(
+                    lineno,
+                    line,
+                    'Invalid command: `!@{0}{1}`, (help: try with `@!{1}`)'.format(
+                        '!' if negated else '',
+                        cmd,
+                    ),
+                )
+                continue
             args = m.group('args')
             if args and not args[:1].isspace():
                 print_err(lineno, line, 'Invalid template syntax')
@@ -257,6 +272,7 @@ def flatten(node):
 
 
 def normalize_xpath(path):
+    path = path.replace("{{channel}}", channel)
     if path.startswith('//'):
         return '.' + path  # avoid warnings
     elif path.startswith('.//'):
@@ -321,6 +337,7 @@ class CachedFiles(object):
 
 
 def check_string(data, pat, regexp):
+    pat = pat.replace("{{channel}}", channel)
     if not pat:
         return True  # special case a presence testing
     elif regexp:

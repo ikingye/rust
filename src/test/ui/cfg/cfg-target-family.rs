@@ -1,6 +1,4 @@
-// run-pass
-// ignore-cloudabi no target_family
-// ignore-wasm32-bare no target_family
+// build-pass
 // ignore-sgx
 
 // pretty-expanded FIXME #23616
@@ -10,5 +8,9 @@ pub fn main() {
 }
 
 #[cfg(target_family = "unix")]
+pub fn main() {
+}
+
+#[cfg(target_family="wasm")]
 pub fn main() {
 }

@@ -1,4 +1,6 @@
-use crate::utils::{in_macro, snippet, snippet_with_applicability, span_lint_and_sugg};
+use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::source::{snippet, snippet_with_applicability};
+use clippy_utils::{in_macro, is_test_module_or_function};
 use if_chain::if_chain;
 use rustc_errors::Applicability;
 use rustc_hir::{
@@ -7,7 +9,8 @@ use rustc_hir::{
 };
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_tool_lint, impl_lint_pass};
-use rustc_span::BytePos;
+use rustc_span::symbol::kw;
+use rustc_span::{sym, BytePos};
 
 declare_clippy_lint! {
     /// **What it does:** Checks for `use Enum::*`.
@@ -19,8 +22,14 @@ declare_clippy_lint! {
     /// still around.
     ///
     /// **Example:**
-    /// ```rust
+    /// ```rust,ignore
+    /// // Bad
     /// use std::cmp::Ordering::*;
+    /// foo(Less);
+    ///
+    /// // Good
+    /// use std::cmp::Ordering;
+    /// foo(Ordering::Less)
     /// ```
     pub ENUM_GLOB_USE,
     pedantic,
@@ -30,7 +39,7 @@ declare_clippy_lint! {
 declare_clippy_lint! {
     /// **What it does:** Checks for wildcard imports `use _::*`.
     ///
-    /// **Why is this bad?** wildcard imports can polute the namespace. This is especially bad if
+    /// **Why is this bad?** wildcard imports can pollute the namespace. This is especially bad if
     /// you try to import something through a wildcard, that already has been imported by name from
     /// a different source:
     ///
@@ -60,15 +69,15 @@ declare_clippy_lint! {
     ///
     /// **Example:**
     ///
-    /// Bad:
     /// ```rust,ignore
+    /// // Bad
     /// use crate1::*;
     ///
     /// foo();
     /// ```
     ///
-    /// Good:
     /// ```rust,ignore
+    /// // Good
     /// use crate1::foo;
     ///
     /// foo();
@@ -95,9 +104,9 @@ impl WildcardImports {
 
 impl_lint_pass!(WildcardImports => [ENUM_GLOB_USE, WILDCARD_IMPORTS]);
 
-impl LateLintPass<'_, '_> for WildcardImports {
-    fn check_item(&mut self, cx: &LateContext<'_, '_>, item: &Item<'_>) {
-        if is_test_module_or_function(item) {
+impl LateLintPass<'_> for WildcardImports {
+    fn check_item(&mut self, cx: &LateContext<'_>, item: &Item<'_>) {
+        if is_test_module_or_function(cx.tcx, item) {
             self.test_modules_deep = self.test_modules_deep.saturating_add(1);
         }
         if item.vis.node.is_pub() || item.vis.node.is_pub_restricted() {
@@ -106,7 +115,7 @@ impl LateLintPass<'_, '_> for WildcardImports {
         if_chain! {
             if let ItemKind::Use(use_path, UseKind::Glob) = &item.kind;
             if self.warn_on_all || !self.check_exceptions(item, use_path.segments);
-            let used_imports = cx.tcx.names_imported_by_glob_use(item.hir_id.owner);
+            let used_imports = cx.tcx.names_imported_by_glob_use(item.def_id);
             if !used_imports.is_empty(); // Already handled by `unused_imports`
             then {
                 let mut applicability = Applicability::MachineApplicable;
@@ -174,8 +183,8 @@ impl LateLintPass<'_, '_> for WildcardImports {
         }
     }
 
-    fn check_item_post(&mut self, _: &LateContext<'_, '_>, item: &Item<'_>) {
-        if is_test_module_or_function(item) {
+    fn check_item_post(&mut self, cx: &LateContext<'_>, item: &Item<'_>) {
+        if is_test_module_or_function(cx.tcx, item) {
             self.test_modules_deep = self.test_modules_deep.saturating_sub(1);
         }
     }
@@ -189,20 +198,13 @@ impl WildcardImports {
     }
 }
 
-// Allow "...prelude::*" imports.
+// Allow "...prelude::..::*" imports.
 // Many crates have a prelude, and it is imported as a glob by design.
 fn is_prelude_import(segments: &[PathSegment<'_>]) -> bool {
-    segments
-        .iter()
-        .last()
-        .map_or(false, |ps| ps.ident.as_str() == "prelude")
+    segments.iter().any(|ps| ps.ident.name == sym::prelude)
 }
 
 // Allow "super::*" imports in tests.
 fn is_super_only_import(segments: &[PathSegment<'_>]) -> bool {
-    segments.len() == 1 && segments[0].ident.as_str() == "super"
-}
-
-fn is_test_module_or_function(item: &Item<'_>) -> bool {
-    matches!(item.kind, ItemKind::Mod(..)) && item.ident.name.as_str().contains("test")
+    segments.len() == 1 && segments[0].ident.name == kw::Super
 }

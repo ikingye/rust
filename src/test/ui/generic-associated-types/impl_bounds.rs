@@ -6,6 +6,7 @@ trait Foo {
     type A<'a> where Self: 'a;
     type B<'a, 'b> where 'a: 'b;
     type C where Self: Clone;
+    fn d() where Self: Clone;
 }
 
 #[derive(Copy, Clone)]
@@ -16,8 +17,11 @@ impl<T> Foo for Fooy<T> {
     //~^ ERROR the parameter type `T` may not live long enough
     type B<'a, 'b> where 'b: 'a = (&'a(), &'b ());
     //~^ ERROR lifetime bound not satisfied
+    //~| ERROR lifetime bound not satisfied
     type C where Self: Copy = String;
-    //~^ ERROR the trait bound `T: std::marker::Copy` is not satisfied
+    //~^ ERROR the trait bound `T: Copy` is not satisfied
+    fn d() where Self: Copy {}
+    //~^ ERROR the trait bound `T: Copy` is not satisfied
 }
 
 fn main() {}

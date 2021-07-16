@@ -2,7 +2,6 @@
 
 // run-pass
 
-#![feature(const_fn, const_if_match)]
 #[derive(PartialEq, Debug, Clone)]
 struct N(u8);
 

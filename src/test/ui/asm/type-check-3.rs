@@ -1,20 +1,20 @@
 // only-x86_64
 // compile-flags: -C target-feature=+avx512f
 
-#![feature(asm)]
+#![feature(asm, global_asm)]
 
 use std::arch::x86_64::{_mm256_setzero_ps, _mm_setzero_ps};
 
 fn main() {
     unsafe {
-        // Types must be in the whitelist for the register class
+        // Types must be listed in the register class.
 
         asm!("{}", in(reg) 0i128);
         //~^ ERROR type `i128` cannot be used with this register class
         asm!("{}", in(reg) _mm_setzero_ps());
-        //~^ ERROR type `std::arch::x86_64::__m128` cannot be used with this register class
+        //~^ ERROR type `__m128` cannot be used with this register class
         asm!("{}", in(reg) _mm256_setzero_ps());
-        //~^ ERROR type `std::arch::x86_64::__m256` cannot be used with this register class
+        //~^ ERROR type `__m256` cannot be used with this register class
         asm!("{}", in(xmm_reg) 0u8);
         //~^ ERROR type `u8` cannot be used with this register class
         asm!("{:e}", in(reg) 0i32);
@@ -69,3 +69,21 @@ fn main() {
         asm!("{:r}", inout(reg) main => val_u64);
     }
 }
+
+// Constants must be... constant
+
+static S: i32 = 1;
+const fn const_foo(x: i32) -> i32 {
+    x
+}
+const fn const_bar<T>(x: T) -> T {
+    x
+}
+global_asm!("{}", const S);
+//~^ ERROR constants cannot refer to statics
+global_asm!("{}", const const_foo(0));
+global_asm!("{}", const const_foo(S));
+//~^ ERROR constants cannot refer to statics
+global_asm!("{}", const const_bar(0));
+global_asm!("{}", const const_bar(S));
+//~^ ERROR constants cannot refer to statics

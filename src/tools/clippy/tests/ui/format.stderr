@@ -25,7 +25,13 @@ LL | /     format!(
 LL | |         r##"foo {{}}
 LL | | " bar"##
 LL | |     );
-   | |______^ help: consider using `.to_string()`: `"foo {}/n/" bar".to_string();`
+   | |______^
+   |
+help: consider using `.to_string()`
+   |
+LL |     r##"foo {}
+LL | " bar"##.to_string();
+   |
 
 error: useless use of `format!`
   --> $DIR/format.rs:21:5
@@ -81,5 +87,11 @@ error: useless use of `format!`
 LL |     let _ = Some(format!("{}", a + "bar"));
    |                  ^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.to_string()`: `a + "bar"`
 
-error: aborting due to 13 previous errors
+error: useless use of `format!`
+  --> $DIR/format.rs:73:22
+   |
+LL |     let _s: String = format!("{}", &*v.join("/n"));
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.to_string()`: `(&*v.join("/n")).to_string()`
+
+error: aborting due to 14 previous errors
 

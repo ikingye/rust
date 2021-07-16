@@ -51,6 +51,14 @@ pub struct Feature {
     pub has_gate_test: bool,
     pub tracking_issue: Option<NonZeroU32>,
 }
+impl Feature {
+    fn tracking_issue_display(&self) -> impl fmt::Display {
+        match self.tracking_issue {
+            None => "none".to_string(),
+            Some(x) => x.to_string(),
+        }
+    }
+}
 
 pub type Features = HashMap<String, Feature>;
 
@@ -71,15 +79,25 @@ pub fn collect_lib_features(base_src_path: &Path) -> Features {
     lib_features
 }
 
-pub fn check(path: &Path, bad: &mut bool, verbose: bool) -> CollectedFeatures {
-    let mut features = collect_lang_features(path, bad);
+pub fn check(
+    src_path: &Path,
+    compiler_path: &Path,
+    lib_path: &Path,
+    bad: &mut bool,
+    verbose: bool,
+) -> CollectedFeatures {
+    let mut features = collect_lang_features(compiler_path, bad);
     assert!(!features.is_empty());
 
-    let lib_features = get_and_check_lib_features(path, bad, &features);
+    let lib_features = get_and_check_lib_features(lib_path, bad, &features);
     assert!(!lib_features.is_empty());
 
     super::walk_many(
-        &[&path.join("test/ui"), &path.join("test/ui-fulldeps"), &path.join("test/compile-fail")],
+        &[
+            &src_path.join("test/ui"),
+            &src_path.join("test/ui-fulldeps"),
+            &src_path.join("test/rustdoc-ui"),
+        ],
         &mut |path| super::filter_dirs(path),
         &mut |entry, contents| {
             let file = entry.path();
@@ -102,6 +120,7 @@ pub fn check(path: &Path, bad: &mut bool, verbose: bool) -> CollectedFeatures {
                 let gate_test_str = "gate-test-";
 
                 let feature_name = match line.find(gate_test_str) {
+                    // NB: the `splitn` always succeeds, even if the delimiter is not present.
                     Some(i) => line[i + gate_test_str.len()..].splitn(2, ' ').next().unwrap(),
                     None => continue,
                 };
@@ -221,15 +240,15 @@ fn test_filen_gate(filen_underscore: &str, features: &mut Features) -> bool {
     false
 }
 
-pub fn collect_lang_features(base_src_path: &Path, bad: &mut bool) -> Features {
-    let mut all = collect_lang_features_in(base_src_path, "active.rs", bad);
-    all.extend(collect_lang_features_in(base_src_path, "accepted.rs", bad));
-    all.extend(collect_lang_features_in(base_src_path, "removed.rs", bad));
+pub fn collect_lang_features(base_compiler_path: &Path, bad: &mut bool) -> Features {
+    let mut all = collect_lang_features_in(base_compiler_path, "active.rs", bad);
+    all.extend(collect_lang_features_in(base_compiler_path, "accepted.rs", bad));
+    all.extend(collect_lang_features_in(base_compiler_path, "removed.rs", bad));
     all
 }
 
 fn collect_lang_features_in(base: &Path, file: &str, bad: &mut bool) -> Features {
-    let path = base.join("librustc_feature").join(file);
+    let path = base.join("rustc_feature").join("src").join(file);
     let contents = t!(fs::read_to_string(&path));
 
     // We allow rustc-internal features to omit a tracking issue.
@@ -282,6 +301,7 @@ fn collect_lang_features_in(base: &Path, file: &str, bad: &mut bool) -> Features
             let mut parts = line.split(',');
             let level = match parts.next().map(|l| l.trim().trim_start_matches('(')) {
                 Some("active") => Status::Unstable,
+                Some("incomplete") => Status::Unstable,
                 Some("removed") => Status::Removed,
                 Some("accepted") => Status::Stable,
                 _ => return None,
@@ -319,7 +339,6 @@ fn collect_lang_features_in(base: &Path, file: &str, bad: &mut bool) -> Features
             let issue_str = parts.next().unwrap().trim();
             let tracking_issue = if issue_str.starts_with("None") {
                 if level == Status::Unstable && !next_feature_omits_tracking_issue {
-                    *bad = true;
                     tidy_error!(
                         bad,
                         "{}:{}: no tracking issue for feature {}",
@@ -351,10 +370,12 @@ fn get_and_check_lib_features(
                     if f.tracking_issue != s.tracking_issue && f.level != Status::Stable {
                         tidy_error!(
                             bad,
-                            "{}:{}: mismatches the `issue` in {}",
+                            "{}:{}: `issue` \"{}\" mismatches the {} `issue` of \"{}\"",
                             file.display(),
                             line,
-                            display
+                            f.tracking_issue_display(),
+                            display,
+                            s.tracking_issue_display(),
                         );
                     }
                 }
@@ -412,7 +433,16 @@ fn map_lib_features(
                         mf(Err($msg), file, i + 1);
                         continue;
                     }};
-                };
+                }
+
+                lazy_static::lazy_static! {
+                    static ref COMMENT_LINE: Regex = Regex::new(r"^\s*//").unwrap();
+                }
+                // exclude commented out lines
+                if COMMENT_LINE.is_match(line) {
+                    continue;
+                }
+
                 if let Some((ref name, ref mut f)) = becoming_feature {
                     if f.tracking_issue.is_none() {
                         f.tracking_issue = find_attr_val(line, "issue").and_then(handle_issue_none);
@@ -444,10 +474,7 @@ fn map_lib_features(
                         level: Status::Unstable,
                         since: None,
                         has_gate_test: false,
-                        // FIXME(#57563): #57563 is now used as a common tracking issue,
-                        // although we would like to have specific tracking issues for each
-                        // `rustc_const_unstable` in the future.
-                        tracking_issue: NonZeroU32::new(57563),
+                        tracking_issue: find_attr_val(line, "issue").and_then(handle_issue_none),
                     };
                     mf(Ok((feature_name, feature)), file, i + 1);
                     continue;

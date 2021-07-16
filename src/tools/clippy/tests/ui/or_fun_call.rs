@@ -2,6 +2,7 @@
 
 #![warn(clippy::or_fun_call)]
 #![allow(dead_code)]
+#![allow(clippy::unnecessary_wraps)]
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -61,8 +62,14 @@ fn or_fun_call() {
     let mut map = HashMap::<u64, String>::new();
     map.entry(42).or_insert(String::new());
 
+    let mut map_vec = HashMap::<u64, Vec<i32>>::new();
+    map_vec.entry(42).or_insert(vec![]);
+
     let mut btree = BTreeMap::<u64, String>::new();
     btree.entry(42).or_insert(String::new());
+
+    let mut btree_vec = BTreeMap::<u64, Vec<i32>>::new();
+    btree_vec.entry(42).or_insert(vec![]);
 
     let stringy = Some(String::from(""));
     let _ = stringy.unwrap_or("".to_owned());
@@ -70,6 +77,15 @@ fn or_fun_call() {
     let opt = Some(1);
     let hello = "Hello";
     let _ = opt.ok_or(format!("{} world.", hello));
+
+    // index
+    let map = HashMap::<u64, u64>::new();
+    let _ = Some(1).unwrap_or(map[&1]);
+    let map = BTreeMap::<u64, u64>::new();
+    let _ = Some(1).unwrap_or(map[&1]);
+    // don't lint index vec
+    let vec = vec![1];
+    let _ = Some(1).unwrap_or(vec[1]);
 }
 
 struct Foo(u8);
@@ -95,6 +111,18 @@ fn test_or_with_ctors() {
     let b = "b".to_string();
     let _ = Some(Bar("a".to_string(), Duration::from_secs(1)))
         .or(Some(Bar(b, Duration::from_secs(2))));
+
+    let vec = vec!["foo"];
+    let _ = opt.ok_or(vec.len());
+
+    let array = ["foo"];
+    let _ = opt.ok_or(array.len());
+
+    let slice = &["foo"][..];
+    let _ = opt.ok_or(slice.len());
+
+    let string = "foo";
+    let _ = opt.ok_or(string.len());
 }
 
 // Issue 4514 - early return
@@ -105,6 +133,20 @@ fn f() -> Option<()> {
     let _ = a.unwrap_or(b.checked_mul(3)?.min(240));
 
     Some(())
+}
+
+mod issue6675 {
+    unsafe fn foo() {
+        let mut s = "test".to_owned();
+        None.unwrap_or(s.as_mut_vec());
+    }
+
+    fn bar() {
+        let mut s = "test".to_owned();
+        None.unwrap_or(unsafe { s.as_mut_vec() });
+        #[rustfmt::skip]
+        None.unwrap_or( unsafe { s.as_mut_vec() }    );
+    }
 }
 
 fn main() {}

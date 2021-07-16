@@ -1,12 +1,12 @@
 // needs-sanitizer-support
-// only-x86_64
+// needs-sanitizer-leak
 //
 // compile-flags: -Z sanitizer=leak -O
 //
 // run-fail
 // error-pattern: LeakSanitizer: detected memory leaks
 
-#![feature(test)]
+#![feature(bench_black_box)]
 
 use std::hint::black_box;
 use std::mem;

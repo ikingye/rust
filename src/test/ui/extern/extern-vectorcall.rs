@@ -1,6 +1,7 @@
 // run-pass
-// ignore-arm
-// ignore-aarch64
+// revisions: x64 x32
+// [x64]only-x86_64
+// [x32]only-i686
 
 #![feature(abi_vectorcall)]
 

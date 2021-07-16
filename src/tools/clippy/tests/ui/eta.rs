@@ -16,10 +16,25 @@
 
 use std::path::PathBuf;
 
+macro_rules! mac {
+    () => {
+        foobar()
+    };
+}
+
+macro_rules! closure_mac {
+    () => {
+        |n| foo(n)
+    };
+}
+
 fn main() {
     let a = Some(1u8).map(|a| foo(a));
     meta(|a| foo(a));
     let c = Some(1u8).map(|a| {1+2; foo}(a));
+    true.then(|| mac!()); // don't lint function in macro expansion
+    Some(1).map(closure_mac!()); // don't lint closure in macro expansion
+    let _: Option<Vec<u8>> = true.then(|| vec![]); // special case vec!
     let d = Some(1u8).map(|a| foo((|b| foo2(b))(a))); //is adjusted?
     all(&[1, 2, 3], &&2, |x, y| below(x, y)); //is adjusted
     unsafe {
@@ -33,6 +48,9 @@ fn main() {
     // See #515
     let a: Option<Box<dyn (::std::ops::Deref<Target = [i32]>)>> =
         Some(vec![1i32, 2]).map(|v| -> Box<dyn (::std::ops::Deref<Target = [i32]>)> { Box::new(v) });
+
+    // issue #7224
+    let _: Option<Vec<u32>> = Some(0).map(|_| vec![]);
 }
 
 trait TestTrait {
@@ -201,4 +219,20 @@ impl std::ops::Deref for Bar {
 
 fn test_deref_with_trait_method() {
     let _ = [Bar].iter().map(|s| s.to_string()).collect::<Vec<_>>();
+}
+
+fn mutable_closure_used_again(x: Vec<i32>, y: Vec<i32>, z: Vec<i32>) {
+    let mut res = Vec::new();
+    let mut add_to_res = |n| res.push(n);
+    x.into_iter().for_each(|x| add_to_res(x));
+    y.into_iter().for_each(|x| add_to_res(x));
+    z.into_iter().for_each(|x| add_to_res(x));
+}
+
+fn mutable_closure_in_loop() {
+    let mut value = 0;
+    let mut closure = |n| value += n;
+    for _ in 0..5 {
+        Some(1).map(|n| closure(n));
+    }
 }

@@ -2,9 +2,10 @@
 //!
 //! This lint is **warn** by default
 
-use crate::utils::sugg::Sugg;
-use crate::utils::{higher, parent_node_is_if_expr, snippet_with_applicability, span_lint, span_lint_and_sugg};
-use if_chain::if_chain;
+use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg};
+use clippy_utils::source::snippet_with_applicability;
+use clippy_utils::sugg::Sugg;
+use clippy_utils::{is_else_clause, is_expn_of};
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::{BinOpKind, Block, Expr, ExprKind, StmtKind, UnOp};
@@ -15,8 +16,7 @@ use rustc_span::Span;
 
 declare_clippy_lint! {
     /// **What it does:** Checks for expressions of the form `if c { true } else {
-    /// false }`
-    /// (or vice versa) and suggest using the condition directly.
+    /// false }` (or vice versa) and suggests using the condition directly.
     ///
     /// **Why is this bad?** Redundant code.
     ///
@@ -68,10 +68,13 @@ declare_clippy_lint! {
 
 declare_lint_pass!(NeedlessBool => [NEEDLESS_BOOL]);
 
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NeedlessBool {
-    fn check_expr(&mut self, cx: &LateContext<'a, 'tcx>, e: &'tcx Expr<'_>) {
+impl<'tcx> LateLintPass<'tcx> for NeedlessBool {
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) {
         use self::Expression::{Bool, RetBool};
-        if let Some((ref pred, ref then_block, Some(ref else_expr))) = higher::if_block(&e) {
+        if e.span.from_expansion() {
+            return;
+        }
+        if let ExprKind::If(pred, then_block, Some(else_expr)) = e.kind {
             let reduce = |ret, not| {
                 let mut applicability = Applicability::MachineApplicable;
                 let snip = Sugg::hir_with_applicability(cx, pred, "<predicate>", &mut applicability);
@@ -81,8 +84,8 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NeedlessBool {
                     snip = snip.make_return();
                 }
 
-                if parent_node_is_if_expr(&e, &cx) {
-                    snip = snip.blockify()
+                if is_else_clause(cx.tcx, e) {
+                    snip = snip.blockify();
                 }
 
                 span_lint_and_sugg(
@@ -95,7 +98,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NeedlessBool {
                     applicability,
                 );
             };
-            if let ExprKind::Block(ref then_block, _) = then_block.kind {
+            if let ExprKind::Block(then_block, _) = then_block.kind {
                 match (fetch_bool_block(then_block), fetch_bool_expr(else_expr)) {
                     (RetBool(true), RetBool(true)) | (Bool(true), Bool(true)) => {
                         span_lint(
@@ -128,8 +131,8 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NeedlessBool {
 
 declare_lint_pass!(BoolComparison => [BOOL_COMPARISON]);
 
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for BoolComparison {
-    fn check_expr(&mut self, cx: &LateContext<'a, 'tcx>, e: &'tcx Expr<'_>) {
+impl<'tcx> LateLintPass<'tcx> for BoolComparison {
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) {
         if e.span.from_expansion() {
             return;
         }
@@ -144,7 +147,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for BoolComparison {
                         |h: Sugg<'_>| !h,
                         "equality checks against false can be replaced by a negation",
                     ));
-                    check_comparison(cx, e, true_case, false_case, true_case, false_case, ignore_no_literal)
+                    check_comparison(cx, e, true_case, false_case, true_case, false_case, ignore_no_literal);
                 },
                 BinOpKind::Ne => {
                     let true_case = Some((
@@ -152,7 +155,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for BoolComparison {
                         "inequality checks against true can be replaced by a negation",
                     ));
                     let false_case = Some((|h| h, "inequality checks against false are unnecessary"));
-                    check_comparison(cx, e, true_case, false_case, true_case, false_case, ignore_no_literal)
+                    check_comparison(cx, e, true_case, false_case, true_case, false_case, ignore_no_literal);
                 },
                 BinOpKind::Lt => check_comparison(
                     cx,
@@ -197,13 +200,9 @@ struct ExpressionInfoWithSpan {
 }
 
 fn is_unary_not(e: &Expr<'_>) -> (bool, Span) {
-    if_chain! {
-        if let ExprKind::Unary(unop, operand) = e.kind;
-        if let UnOp::UnNot = unop;
-        then {
-            return (true, operand.span);
-        }
-    };
+    if let ExprKind::Unary(UnOp::Not, operand) = e.kind {
+        return (true, operand.span);
+    }
     (false, e.span)
 }
 
@@ -219,7 +218,7 @@ fn one_side_is_unary_not<'tcx>(left_side: &'tcx Expr<'_>, right_side: &'tcx Expr
 }
 
 fn check_comparison<'a, 'tcx>(
-    cx: &LateContext<'a, 'tcx>,
+    cx: &LateContext<'tcx>,
     e: &'tcx Expr<'_>,
     left_true: Option<(impl FnOnce(Sugg<'a>) -> Sugg<'a>, &str)>,
     left_false: Option<(impl FnOnce(Sugg<'a>) -> Sugg<'a>, &str)>,
@@ -229,19 +228,25 @@ fn check_comparison<'a, 'tcx>(
 ) {
     use self::Expression::{Bool, Other};
 
-    if let ExprKind::Binary(op, ref left_side, ref right_side) = e.kind {
-        let (l_ty, r_ty) = (cx.tables.expr_ty(left_side), cx.tables.expr_ty(right_side));
+    if let ExprKind::Binary(op, left_side, right_side) = e.kind {
+        let (l_ty, r_ty) = (
+            cx.typeck_results().expr_ty(left_side),
+            cx.typeck_results().expr_ty(right_side),
+        );
+        if is_expn_of(left_side.span, "cfg").is_some() || is_expn_of(right_side.span, "cfg").is_some() {
+            return;
+        }
         if l_ty.is_bool() && r_ty.is_bool() {
             let mut applicability = Applicability::MachineApplicable;
 
             if let BinOpKind::Eq = op.node {
-                let expression_info = one_side_is_unary_not(&left_side, &right_side);
+                let expression_info = one_side_is_unary_not(left_side, right_side);
                 if expression_info.one_side_is_unary_not {
                     span_lint_and_sugg(
                         cx,
                         BOOL_COMPARISON,
                         e.span,
-                        "This comparison might be written more concisely",
+                        "this comparison might be written more concisely",
                         "try simplifying it as shown",
                         format!(
                             "{} != {}",
@@ -249,22 +254,22 @@ fn check_comparison<'a, 'tcx>(
                             snippet_with_applicability(cx, expression_info.right_span, "..", &mut applicability)
                         ),
                         applicability,
-                    )
+                    );
                 }
             }
 
             match (fetch_bool_expr(left_side), fetch_bool_expr(right_side)) {
                 (Bool(true), Other) => left_true.map_or((), |(h, m)| {
-                    suggest_bool_comparison(cx, e, right_side, applicability, m, h)
+                    suggest_bool_comparison(cx, e, right_side, applicability, m, h);
                 }),
                 (Other, Bool(true)) => right_true.map_or((), |(h, m)| {
-                    suggest_bool_comparison(cx, e, left_side, applicability, m, h)
+                    suggest_bool_comparison(cx, e, left_side, applicability, m, h);
                 }),
                 (Bool(false), Other) => left_false.map_or((), |(h, m)| {
-                    suggest_bool_comparison(cx, e, right_side, applicability, m, h)
+                    suggest_bool_comparison(cx, e, right_side, applicability, m, h);
                 }),
                 (Other, Bool(false)) => right_false.map_or((), |(h, m)| {
-                    suggest_bool_comparison(cx, e, left_side, applicability, m, h)
+                    suggest_bool_comparison(cx, e, left_side, applicability, m, h);
                 }),
                 (Other, Other) => no_literal.map_or((), |(h, m)| {
                     let left_side = Sugg::hir_with_applicability(cx, left_side, "..", &mut applicability);
@@ -277,7 +282,7 @@ fn check_comparison<'a, 'tcx>(
                         "try simplifying it as shown",
                         h(left_side, right_side).to_string(),
                         applicability,
-                    )
+                    );
                 }),
                 _ => (),
             }
@@ -286,14 +291,21 @@ fn check_comparison<'a, 'tcx>(
 }
 
 fn suggest_bool_comparison<'a, 'tcx>(
-    cx: &LateContext<'a, 'tcx>,
+    cx: &LateContext<'tcx>,
     e: &'tcx Expr<'_>,
     expr: &Expr<'_>,
     mut applicability: Applicability,
     message: &str,
     conv_hint: impl FnOnce(Sugg<'a>) -> Sugg<'a>,
 ) {
-    let hint = Sugg::hir_with_applicability(cx, expr, "..", &mut applicability);
+    let hint = if expr.span.from_expansion() {
+        if applicability != Applicability::Unspecified {
+            applicability = Applicability::MaybeIncorrect;
+        }
+        Sugg::hir_with_macro_callsite(cx, expr, "..")
+    } else {
+        Sugg::hir_with_applicability(cx, expr, "..", &mut applicability)
+    };
     span_lint_and_sugg(
         cx,
         BOOL_COMPARISON,
@@ -315,9 +327,9 @@ fn fetch_bool_block(block: &Block<'_>) -> Expression {
     match (&*block.stmts, block.expr.as_ref()) {
         (&[], Some(e)) => fetch_bool_expr(&**e),
         (&[ref e], None) => {
-            if let StmtKind::Semi(ref e) = e.kind {
+            if let StmtKind::Semi(e) = e.kind {
                 if let ExprKind::Ret(_) = e.kind {
-                    fetch_bool_expr(&**e)
+                    fetch_bool_expr(e)
                 } else {
                     Expression::Other
                 }
@@ -331,7 +343,7 @@ fn fetch_bool_block(block: &Block<'_>) -> Expression {
 
 fn fetch_bool_expr(expr: &Expr<'_>) -> Expression {
     match expr.kind {
-        ExprKind::Block(ref block, _) => fetch_bool_block(block),
+        ExprKind::Block(block, _) => fetch_bool_block(block),
         ExprKind::Lit(ref lit_ptr) => {
             if let LitKind::Bool(value) = lit_ptr.node {
                 Expression::Bool(value)
@@ -339,7 +351,7 @@ fn fetch_bool_expr(expr: &Expr<'_>) -> Expression {
                 Expression::Other
             }
         },
-        ExprKind::Ret(Some(ref expr)) => match fetch_bool_expr(expr) {
+        ExprKind::Ret(Some(expr)) => match fetch_bool_expr(expr) {
             Expression::Bool(value) => Expression::RetBool(value),
             _ => Expression::Other,
         },

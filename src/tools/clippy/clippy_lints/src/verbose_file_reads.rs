@@ -1,4 +1,6 @@
-use crate::utils::{match_type, paths, span_lint_and_help};
+use clippy_utils::diagnostics::span_lint_and_help;
+use clippy_utils::paths;
+use clippy_utils::ty::match_type;
 use if_chain::if_chain;
 use rustc_hir::{Expr, ExprKind, QPath};
 use rustc_lint::{LateContext, LateLintPass};
@@ -9,6 +11,7 @@ declare_clippy_lint! {
     ///
     /// **Why is this bad?** `fs::{read, read_to_string}` provide the same functionality when `buf` is empty with fewer imports and no intermediate values.
     /// See also: [fs::read docs](https://doc.rust-lang.org/std/fs/fn.read.html), [fs::read_to_string docs](https://doc.rust-lang.org/std/fs/fn.read_to_string.html)
+    ///
     /// **Known problems:** None.
     ///
     /// **Example:**
@@ -32,8 +35,8 @@ declare_clippy_lint! {
 
 declare_lint_pass!(VerboseFileReads => [VERBOSE_FILE_READS]);
 
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for VerboseFileReads {
-    fn check_expr(&mut self, cx: &LateContext<'a, 'tcx>, expr: &'tcx Expr<'tcx>) {
+impl<'tcx> LateLintPass<'tcx> for VerboseFileReads {
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
         if is_file_read_to_end(cx, expr) {
             span_lint_and_help(
                 cx,
@@ -51,17 +54,17 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for VerboseFileReads {
                 "use of `File::read_to_string`",
                 None,
                 "consider using `fs::read_to_string` instead",
-            )
+            );
         }
     }
 }
 
-fn is_file_read_to_end<'a, 'tcx>(cx: &LateContext<'a, 'tcx>, expr: &'tcx Expr<'tcx>) -> bool {
+fn is_file_read_to_end<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> bool {
     if_chain! {
-        if let ExprKind::MethodCall(method_name, _, exprs) = expr.kind;
+        if let ExprKind::MethodCall(method_name, _, exprs, _) = expr.kind;
         if method_name.ident.as_str() == "read_to_end";
         if let ExprKind::Path(QPath::Resolved(None, _)) = &exprs[0].kind;
-        let ty = cx.tables.expr_ty(&exprs[0]);
+        let ty = cx.typeck_results().expr_ty(&exprs[0]);
         if match_type(cx, ty, &paths::FILE);
         then {
             return true
@@ -70,12 +73,12 @@ fn is_file_read_to_end<'a, 'tcx>(cx: &LateContext<'a, 'tcx>, expr: &'tcx Expr<'t
     false
 }
 
-fn is_file_read_to_string<'a, 'tcx>(cx: &LateContext<'a, 'tcx>, expr: &'tcx Expr<'tcx>) -> bool {
+fn is_file_read_to_string<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> bool {
     if_chain! {
-        if let ExprKind::MethodCall(method_name, _, exprs) = expr.kind;
+        if let ExprKind::MethodCall(method_name, _, exprs, _) = expr.kind;
         if method_name.ident.as_str() == "read_to_string";
         if let ExprKind::Path(QPath::Resolved(None, _)) = &exprs[0].kind;
-        let ty = cx.tables.expr_ty(&exprs[0]);
+        let ty = cx.typeck_results().expr_ty(&exprs[0]);
         if match_type(cx, ty, &paths::FILE);
         then {
             return true

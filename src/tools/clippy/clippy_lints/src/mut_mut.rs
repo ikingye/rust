@@ -1,4 +1,5 @@
-use crate::utils::{higher, span_lint};
+use clippy_utils::diagnostics::span_lint;
+use clippy_utils::higher;
 use rustc_hir as hir;
 use rustc_hir::intravisit;
 use rustc_lint::{LateContext, LateLintPass, LintContext};
@@ -28,12 +29,12 @@ declare_clippy_lint! {
 
 declare_lint_pass!(MutMut => [MUT_MUT]);
 
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for MutMut {
-    fn check_block(&mut self, cx: &LateContext<'a, 'tcx>, block: &'tcx hir::Block<'_>) {
+impl<'tcx> LateLintPass<'tcx> for MutMut {
+    fn check_block(&mut self, cx: &LateContext<'tcx>, block: &'tcx hir::Block<'_>) {
         intravisit::walk_block(&mut MutVisitor { cx }, block);
     }
 
-    fn check_ty(&mut self, cx: &LateContext<'a, 'tcx>, ty: &'tcx hir::Ty<'_>) {
+    fn check_ty(&mut self, cx: &LateContext<'tcx>, ty: &'tcx hir::Ty<'_>) {
         use rustc_hir::intravisit::Visitor;
 
         MutVisitor { cx }.visit_ty(ty);
@@ -41,7 +42,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for MutMut {
 }
 
 pub struct MutVisitor<'a, 'tcx> {
-    cx: &'a LateContext<'a, 'tcx>,
+    cx: &'a LateContext<'tcx>,
 }
 
 impl<'a, 'tcx> intravisit::Visitor<'tcx> for MutVisitor<'a, 'tcx> {
@@ -52,7 +53,7 @@ impl<'a, 'tcx> intravisit::Visitor<'tcx> for MutVisitor<'a, 'tcx> {
             return;
         }
 
-        if let Some((_, arg, body)) = higher::for_loop(expr) {
+        if let Some((_, arg, body, _)) = higher::for_loop(expr) {
             // A `for` loop lowers to:
             // ```rust
             // match ::std::iter::Iterator::next(&mut iter) {
@@ -61,7 +62,7 @@ impl<'a, 'tcx> intravisit::Visitor<'tcx> for MutVisitor<'a, 'tcx> {
             // Let's ignore the generated code.
             intravisit::walk_expr(self, arg);
             intravisit::walk_expr(self, body);
-        } else if let hir::ExprKind::AddrOf(hir::BorrowKind::Ref, hir::Mutability::Mut, ref e) = expr.kind {
+        } else if let hir::ExprKind::AddrOf(hir::BorrowKind::Ref, hir::Mutability::Mut, e) = expr.kind {
             if let hir::ExprKind::AddrOf(hir::BorrowKind::Ref, hir::Mutability::Mut, _) = e.kind {
                 span_lint(
                     self.cx,
@@ -69,7 +70,7 @@ impl<'a, 'tcx> intravisit::Visitor<'tcx> for MutVisitor<'a, 'tcx> {
                     expr.span,
                     "generally you want to avoid `&mut &mut _` if possible",
                 );
-            } else if let ty::Ref(_, _, hir::Mutability::Mut) = self.cx.tables.expr_ty(e).kind {
+            } else if let ty::Ref(_, _, hir::Mutability::Mut) = self.cx.typeck_results().expr_ty(e).kind() {
                 span_lint(
                     self.cx,
                     MUT_MUT,
@@ -84,7 +85,7 @@ impl<'a, 'tcx> intravisit::Visitor<'tcx> for MutVisitor<'a, 'tcx> {
         if let hir::TyKind::Rptr(
             _,
             hir::MutTy {
-                ty: ref pty,
+                ty: pty,
                 mutbl: hir::Mutability::Mut,
             },
         ) = ty.kind

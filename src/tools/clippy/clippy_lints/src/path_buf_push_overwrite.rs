@@ -1,10 +1,12 @@
-use crate::utils::{match_type, paths, span_lint_and_sugg, walk_ptrs_ty};
+use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::ty::is_type_diagnostic_item;
 use if_chain::if_chain;
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_span::symbol::sym;
 use std::path::{Component, Path};
 
 declare_clippy_lint! {
@@ -40,13 +42,13 @@ declare_clippy_lint! {
 
 declare_lint_pass!(PathBufPushOverwrite => [PATH_BUF_PUSH_OVERWRITE]);
 
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for PathBufPushOverwrite {
-    fn check_expr(&mut self, cx: &LateContext<'a, 'tcx>, expr: &'tcx Expr<'_>) {
+impl<'tcx> LateLintPass<'tcx> for PathBufPushOverwrite {
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
         if_chain! {
-            if let ExprKind::MethodCall(ref path, _, ref args) = expr.kind;
+            if let ExprKind::MethodCall(path, _, args, _) = expr.kind;
             if path.ident.name == sym!(push);
             if args.len() == 2;
-            if match_type(cx, walk_ptrs_ty(cx.tables.expr_ty(&args[0])), &paths::PATH_BUF);
+            if is_type_diagnostic_item(cx, cx.typeck_results().expr_ty(&args[0]).peel_refs(), sym::PathBuf);
             if let Some(get_index_arg) = args.get(1);
             if let ExprKind::Lit(ref lit) = get_index_arg.kind;
             if let LitKind::Str(ref path_lit, _) = lit.node;
@@ -60,7 +62,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for PathBufPushOverwrite {
                     cx,
                     PATH_BUF_PUSH_OVERWRITE,
                     lit.span,
-                    "Calling `push` with '/' or '\\' (file system root) will overwrite the previous path definition",
+                    "calling `push` with '/' or '\\' (file system root) will overwrite the previous path definition",
                     "try",
                     format!("\"{}\"", pushed_path_lit.trim_start_matches(|c| c == '/' || c == '\\')),
                     Applicability::MachineApplicable,

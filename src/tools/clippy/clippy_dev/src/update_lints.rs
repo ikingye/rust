@@ -22,20 +22,7 @@ pub fn run(update_mode: UpdateMode) {
 
     let usable_lint_count = round_to_fifty(usable_lints.len());
 
-    let mut file_change = replace_region_in_file(
-        Path::new("src/lintlist/mod.rs"),
-        "begin lint list",
-        "end lint list",
-        false,
-        update_mode == UpdateMode::Change,
-        || {
-            format!("pub static ref ALL_LINTS: Vec<Lint> = vec!{:#?};", sorted_usable_lints)
-                .lines()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        },
-    )
-    .changed;
+    let mut file_change = false;
 
     file_change |= replace_region_in_file(
         Path::new("README.md"),
@@ -81,7 +68,7 @@ pub fn run(update_mode: UpdateMode) {
         "end register lints",
         false,
         update_mode == UpdateMode::Change,
-        || gen_register_lint_list(usable_lints.iter().chain(internal_lints.iter())),
+        || gen_register_lint_list(internal_lints.iter(), usable_lints.iter()),
     )
     .changed;
 
@@ -105,7 +92,10 @@ pub fn run(update_mode: UpdateMode) {
         || {
             // clippy::all should only include the following lint groups:
             let all_group_lints = usable_lints.iter().filter(|l| {
-                l.group == "correctness" || l.group == "style" || l.group == "complexity" || l.group == "perf"
+                matches!(
+                    &*l.group,
+                    "correctness" | "suspicious" | "style" | "complexity" | "perf"
+                )
             });
 
             gen_lint_group_list(all_group_lints)

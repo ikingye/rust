@@ -3,7 +3,10 @@
 #![allow(dead_code)]
 #![allow(unused_assignments)]
 #![allow(unused_variables)]
-#![feature(type_alias_impl_trait)]
+// revisions: min_tait full_tait
+#![feature(min_type_alias_impl_trait)]
+#![cfg_attr(full_tait, feature(type_alias_impl_trait))]
+//[full_tait]~^ WARN incomplete
 
 fn main() {
     assert_eq!(foo().to_string(), "foo");
@@ -70,14 +73,14 @@ fn my_other_iter<U>(u: U) -> MyOtherIter<U> {
 }
 
 trait Trait {}
-type GenericBound<'a, T: Trait> = impl Sized + 'a;
+type GenericBound<'a, T: Trait + 'a> = impl Sized + 'a;
 
 fn generic_bound<'a, T: Trait + 'a>(t: T) -> GenericBound<'a, T> {
     t
 }
 
 mod pass_through {
-    pub type Passthrough<T> = impl Sized + 'static;
+    pub type Passthrough<T: 'static> = impl Sized + 'static;
 
     fn define_passthrough<T: 'static>(t: T) -> Passthrough<T> {
         t

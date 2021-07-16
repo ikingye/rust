@@ -1,9 +1,9 @@
-#![feature(const_fn)]
-#![feature(const_transmute)]
+// stderr-per-bitwidth
+#![feature(const_fn_transmute)]
 
 const fn foo() -> ! {
     unsafe { std::mem::transmute(()) }
-    //~^ WARN any use of this value will cause an error [const_err]
+    //~^ ERROR evaluation of constant value failed
     //~| WARN the type `!` does not permit zero-initialization [invalid_value]
 }
 

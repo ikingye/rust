@@ -12,28 +12,32 @@
 //! bounds by special casing scenarios such as these. Fun!
 
 use std::collections::BTreeMap;
-use std::mem;
 
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty;
+use rustc_span::Symbol;
 
 use crate::clean;
 use crate::clean::GenericArgs as PP;
 use crate::clean::WherePredicate as WP;
 use crate::core::DocContext;
 
-pub fn where_clauses(cx: &DocContext<'_>, clauses: Vec<WP>) -> Vec<WP> {
+crate fn where_clauses(cx: &DocContext<'_>, clauses: Vec<WP>) -> Vec<WP> {
     // First, partition the where clause into its separate components
-    let mut params: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    let mut params: BTreeMap<_, (Vec<_>, Vec<_>)> = BTreeMap::new();
     let mut lifetimes = Vec::new();
     let mut equalities = Vec::new();
     let mut tybounds = Vec::new();
 
     for clause in clauses {
         match clause {
-            WP::BoundPredicate { ty, bounds } => match ty {
-                clean::Generic(s) => params.entry(s).or_default().extend(bounds),
-                t => tybounds.push((t, bounds)),
+            WP::BoundPredicate { ty, bounds, bound_params } => match ty {
+                clean::Generic(s) => {
+                    let (b, p) = params.entry(s).or_default();
+                    b.extend(bounds);
+                    p.extend(bound_params);
+                }
+                t => tybounds.push((t, (bounds, bound_params))),
             },
             WP::RegionPredicate { lifetime, bounds } => {
                 lifetimes.push((lifetime, bounds));
@@ -54,7 +58,7 @@ pub fn where_clauses(cx: &DocContext<'_>, clauses: Vec<WP>) -> Vec<WP> {
             clean::Generic(s) => s,
             _ => return true,
         };
-        let bounds = match params.get_mut(generic) {
+        let (bounds, _) = match params.get_mut(generic) {
             Some(bound) => bound,
             None => return true,
         };
@@ -67,19 +71,25 @@ pub fn where_clauses(cx: &DocContext<'_>, clauses: Vec<WP>) -> Vec<WP> {
     clauses.extend(
         lifetimes.into_iter().map(|(lt, bounds)| WP::RegionPredicate { lifetime: lt, bounds }),
     );
-    clauses.extend(
-        params.into_iter().map(|(k, v)| WP::BoundPredicate { ty: clean::Generic(k), bounds: v }),
-    );
-    clauses.extend(tybounds.into_iter().map(|(ty, bounds)| WP::BoundPredicate { ty, bounds }));
+    clauses.extend(params.into_iter().map(|(k, (bounds, params))| WP::BoundPredicate {
+        ty: clean::Generic(k),
+        bounds,
+        bound_params: params,
+    }));
+    clauses.extend(tybounds.into_iter().map(|(ty, (bounds, bound_params))| WP::BoundPredicate {
+        ty,
+        bounds,
+        bound_params,
+    }));
     clauses.extend(equalities.into_iter().map(|(lhs, rhs)| WP::EqPredicate { lhs, rhs }));
     clauses
 }
 
-pub fn merge_bounds(
+crate fn merge_bounds(
     cx: &clean::DocContext<'_>,
     bounds: &mut Vec<clean::GenericBound>,
     trait_did: DefId,
-    name: &str,
+    name: Symbol,
     rhs: &clean::Type,
 ) -> bool {
     !bounds.iter_mut().any(|b| {
@@ -101,7 +111,7 @@ pub fn merge_bounds(
         match last.args {
             PP::AngleBracketed { ref mut bindings, .. } => {
                 bindings.push(clean::TypeBinding {
-                    name: name.to_string(),
+                    name,
                     kind: clean::TypeBindingKind::Equality { ty: rhs.clone() },
                 });
             }
@@ -118,18 +128,6 @@ pub fn merge_bounds(
     })
 }
 
-pub fn ty_params(mut params: Vec<clean::GenericParamDef>) -> Vec<clean::GenericParamDef> {
-    for param in &mut params {
-        match param.kind {
-            clean::GenericParamDefKind::Type { ref mut bounds, .. } => {
-                *bounds = mem::take(bounds);
-            }
-            _ => panic!("expected only type parameters"),
-        }
-    }
-    params
-}
-
 fn trait_is_same_or_supertrait(cx: &DocContext<'_>, child: DefId, trait_: DefId) -> bool {
     if child == trait_ {
         return true;
@@ -141,12 +139,8 @@ fn trait_is_same_or_supertrait(cx: &DocContext<'_>, child: DefId, trait_: DefId)
         .predicates
         .iter()
         .filter_map(|(pred, _)| {
-            if let ty::PredicateKind::Trait(ref pred, _) = pred.kind() {
-                if pred.skip_binder().trait_ref.self_ty() == self_ty {
-                    Some(pred.def_id())
-                } else {
-                    None
-                }
+            if let ty::PredicateKind::Trait(pred, _) = pred.kind().skip_binder() {
+                if pred.trait_ref.self_ty() == self_ty { Some(pred.def_id()) } else { None }
             } else {
                 None
             }

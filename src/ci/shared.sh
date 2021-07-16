@@ -1,4 +1,5 @@
 #!/bin/false
+# shellcheck shell=bash
 
 # This file is intended to be sourced with `. shared.sh` or
 # `source shared.sh`, hence the invalid shebang and not being
@@ -6,7 +7,7 @@
 
 export MIRRORS_BASE="https://ci-mirrors.rust-lang.org/rustc"
 
-# See http://unix.stackexchange.com/questions/82598
+# See https://unix.stackexchange.com/questions/82598
 # Duplicated in docker/dist-various-2/shared.sh
 function retry {
   echo "Attempting with retry:" "$@"
@@ -38,6 +39,11 @@ function isGitHubActions {
     [[ "${GITHUB_ACTIONS-false}" = "true" ]]
 }
 
+
+function isSelfHostedGitHubActions {
+    [[ "${RUST_GHA_SELF_HOSTED-false}" = "true" ]]
+}
+
 function isMacOS {
     [[ "${OSTYPE}" = "darwin"* ]]
 }
@@ -63,6 +69,18 @@ function isCiBranch {
         [[ "${GITHUB_REF}" = "refs/heads/${name}" ]]
     else
         echo "isCiBranch only works inside CI!"
+        exit 1
+    fi
+}
+
+function ciBaseBranch {
+    if isAzurePipelines; then
+        echo "unsupported on Azure Pipelines"
+        exit 1
+    elif isGitHubActions; then
+        echo "${GITHUB_BASE_REF#refs/heads/}"
+    else
+        echo "ciBaseBranch only works inside CI!"
         exit 1
     fi
 }
@@ -99,7 +117,7 @@ function ciCommandAddPath {
     if isAzurePipelines; then
         echo "##vso[task.prependpath]${path}"
     elif isGitHubActions; then
-        echo "::add-path::${path}"
+        echo "${path}" >> "${GITHUB_PATH}"
     else
         echo "ciCommandAddPath only works inside CI!"
         exit 1
@@ -117,9 +135,17 @@ function ciCommandSetEnv {
     if isAzurePipelines; then
         echo "##vso[task.setvariable variable=${name}]${value}"
     elif isGitHubActions; then
-        echo "::set-env name=${name}::${value}"
+        echo "${name}=${value}" >> "${GITHUB_ENV}"
     else
         echo "ciCommandSetEnv only works inside CI!"
         exit 1
+    fi
+}
+
+function releaseChannel {
+    if [[ -z "${RUST_CI_OVERRIDE_RELEASE_CHANNEL+x}" ]]; then
+        cat "${ci_dir}/channel"
+    else
+        echo $RUST_CI_OVERRIDE_RELEASE_CHANNEL
     fi
 }

@@ -1,6 +1,5 @@
 // needs-sanitizer-support
-// only-linux
-// only-x86_64
+// needs-sanitizer-memory
 //
 // compile-flags: -Z sanitizer=memory -Zsanitizer-memory-track-origins -O
 //
@@ -14,7 +13,7 @@
 
 #![feature(core_intrinsics)]
 #![feature(start)]
-#![feature(test)]
+#![feature(bench_black_box)]
 
 use std::hint::black_box;
 use std::mem::MaybeUninit;

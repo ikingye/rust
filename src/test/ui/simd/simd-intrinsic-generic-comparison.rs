@@ -1,10 +1,10 @@
 // run-pass
 // ignore-emscripten FIXME(#45351) hits an LLVM assert
+// revisions: mir thir
+// [thir]compile-flags: -Zthir-unsafeck
 
 #![feature(repr_simd, platform_intrinsics, concat_idents)]
 #![allow(non_camel_case_types)]
-
-use std::f32::NAN;
 
 #[repr(simd)]
 #[derive(Copy, Clone)]
@@ -94,7 +94,7 @@ fn main() {
     // NAN comparisons are special:
     // -11 (*)    13
     // -5        -100 (*)
-    let f4 = f32x4(NAN, f1.1, NAN, f2.3);
+    let f4 = f32x4(f32::NAN, f1.1, f32::NAN, f2.3);
 
     unsafe {
         tests! {

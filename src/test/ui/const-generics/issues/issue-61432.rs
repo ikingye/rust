@@ -1,15 +1,14 @@
 // run-pass
-
-#![feature(const_generics)]
-//~^ WARN the feature `const_generics` is incomplete
+// revisions: full min
+#![cfg_attr(full, feature(const_generics))] //[full]~WARN the feature `const_generics` is incomplete
 
 fn promote<const N: i32>() {
     // works:
     //
     // let n = N;
-    // &n;
+    // let _ = &n;
 
-    &N;
+    let _ = &N;
 }
 
 fn main() {

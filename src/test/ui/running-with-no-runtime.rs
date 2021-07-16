@@ -1,7 +1,8 @@
 // run-pass
-// ignore-cloudabi spawning processes is not supported
 // ignore-emscripten spawning processes is not supported
 // ignore-sgx no processes
+// revisions: mir thir
+// [thir]compile-flags: -Zthir-unsafeck
 
 #![feature(start)]
 

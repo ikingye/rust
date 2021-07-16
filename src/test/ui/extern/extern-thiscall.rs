@@ -1,6 +1,5 @@
 // run-pass
-// ignore-arm
-// ignore-aarch64
+// only-i686
 
 #![feature(abi_thiscall)]
 

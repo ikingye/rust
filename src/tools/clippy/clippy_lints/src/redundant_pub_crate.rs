@@ -1,4 +1,4 @@
-use crate::utils::span_lint_and_then;
+use clippy_utils::diagnostics::span_lint_and_then;
 use rustc_errors::Applicability;
 use rustc_hir::{Item, ItemKind, VisibilityKind};
 use rustc_lint::{LateContext, LateLintPass};
@@ -39,14 +39,13 @@ pub struct RedundantPubCrate {
 
 impl_lint_pass!(RedundantPubCrate => [REDUNDANT_PUB_CRATE]);
 
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for RedundantPubCrate {
-    fn check_item(&mut self, cx: &LateContext<'a, 'tcx>, item: &'tcx Item<'tcx>) {
+impl<'tcx> LateLintPass<'tcx> for RedundantPubCrate {
+    fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
         if let VisibilityKind::Crate { .. } = item.vis.node {
-            if !cx.access_levels.is_exported(item.hir_id) {
+            if !cx.access_levels.is_exported(item.hir_id()) {
                 if let Some(false) = self.is_exported.last() {
                     let span = item.span.with_hi(item.ident.span.hi());
-                    let def_id = cx.tcx.hir().local_def_id(item.hir_id);
-                    let descr = cx.tcx.def_kind(def_id).descr(def_id.to_def_id());
+                    let descr = cx.tcx.def_kind(item.def_id).descr(item.def_id.to_def_id());
                     span_lint_and_then(
                         cx,
                         REDUNDANT_PUB_CRATE,
@@ -60,17 +59,17 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for RedundantPubCrate {
                                 Applicability::MachineApplicable,
                             );
                         },
-                    )
+                    );
                 }
             }
         }
 
         if let ItemKind::Mod { .. } = item.kind {
-            self.is_exported.push(cx.access_levels.is_exported(item.hir_id));
+            self.is_exported.push(cx.access_levels.is_exported(item.hir_id()));
         }
     }
 
-    fn check_item_post(&mut self, _cx: &LateContext<'a, 'tcx>, item: &'tcx Item<'tcx>) {
+    fn check_item_post(&mut self, _cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
         if let ItemKind::Mod { .. } = item.kind {
             self.is_exported.pop().expect("unbalanced check_item/check_item_post");
         }

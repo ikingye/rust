@@ -1,8 +1,9 @@
+use clippy_utils::diagnostics::span_lint;
+use clippy_utils::ty::{implements_trait, match_type};
+use clippy_utils::{get_trait_def_id, higher, is_qpath_def_path, paths};
 use rustc_hir::{BorrowKind, Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
-
-use crate::utils::{get_trait_def_id, higher, implements_trait, match_qpath, match_type, paths, span_lint};
 
 declare_clippy_lint! {
     /// **What it does:** Checks for iteration that is guaranteed to be infinite.
@@ -44,8 +45,8 @@ declare_clippy_lint! {
 
 declare_lint_pass!(InfiniteIter => [INFINITE_ITER, MAYBE_INFINITE_ITER]);
 
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for InfiniteIter {
-    fn check_expr(&mut self, cx: &LateContext<'a, 'tcx>, expr: &'tcx Expr<'_>) {
+impl<'tcx> LateLintPass<'tcx> for InfiniteIter {
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
         let (lint, msg) = match complete_infinite_iter(cx, expr) {
             Infinite => (INFINITE_ITER, "infinite iteration detected"),
             MaybeInfinite => (MAYBE_INFINITE_ITER, "possible infinite iteration detected"),
@@ -53,7 +54,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for InfiniteIter {
                 return;
             },
         };
-        span_lint(cx, lint, expr.span, msg)
+        span_lint(cx, lint, expr.span, msg);
     }
 }
 
@@ -89,11 +90,7 @@ impl Finiteness {
 impl From<bool> for Finiteness {
     #[must_use]
     fn from(b: bool) -> Self {
-        if b {
-            Infinite
-        } else {
-            Finite
-        }
+        if b { Infinite } else { Finite }
     }
 }
 
@@ -140,9 +137,9 @@ const HEURISTICS: [(&str, usize, Heuristic, Finiteness); 19] = [
     ("scan", 3, First, MaybeInfinite),
 ];
 
-fn is_infinite(cx: &LateContext<'_, '_>, expr: &Expr<'_>) -> Finiteness {
+fn is_infinite(cx: &LateContext<'_>, expr: &Expr<'_>) -> Finiteness {
     match expr.kind {
-        ExprKind::MethodCall(ref method, _, ref args) => {
+        ExprKind::MethodCall(method, _, args, _) => {
             for &(name, len, heuristic, cap) in &HEURISTICS {
                 if method.ident.name.as_str() == name && args.len() == len {
                     return (match heuristic {
@@ -162,16 +159,16 @@ fn is_infinite(cx: &LateContext<'_, '_>, expr: &Expr<'_>) -> Finiteness {
             }
             Finite
         },
-        ExprKind::Block(ref block, _) => block.expr.as_ref().map_or(Finite, |e| is_infinite(cx, e)),
-        ExprKind::Box(ref e) | ExprKind::AddrOf(BorrowKind::Ref, _, ref e) => is_infinite(cx, e),
-        ExprKind::Call(ref path, _) => {
+        ExprKind::Block(block, _) => block.expr.as_ref().map_or(Finite, |e| is_infinite(cx, e)),
+        ExprKind::Box(e) | ExprKind::AddrOf(BorrowKind::Ref, _, e) => is_infinite(cx, e),
+        ExprKind::Call(path, _) => {
             if let ExprKind::Path(ref qpath) = path.kind {
-                match_qpath(qpath, &paths::REPEAT).into()
+                is_qpath_def_path(cx, qpath, path.hir_id, &paths::ITER_REPEAT).into()
             } else {
                 Finite
             }
         },
-        ExprKind::Struct(..) => higher::range(cx, expr).map_or(false, |r| r.end.is_none()).into(),
+        ExprKind::Struct(..) => higher::range(expr).map_or(false, |r| r.end.is_none()).into(),
         _ => Finite,
     }
 }
@@ -216,9 +213,9 @@ const INFINITE_COLLECTORS: [&[&str]; 8] = [
     &paths::VEC_DEQUE,
 ];
 
-fn complete_infinite_iter(cx: &LateContext<'_, '_>, expr: &Expr<'_>) -> Finiteness {
+fn complete_infinite_iter(cx: &LateContext<'_>, expr: &Expr<'_>) -> Finiteness {
     match expr.kind {
-        ExprKind::MethodCall(ref method, _, ref args) => {
+        ExprKind::MethodCall(method, _, args, _) => {
             for &(name, len) in &COMPLETING_METHODS {
                 if method.ident.name.as_str() == name && args.len() == len {
                     return is_infinite(cx, &args[0]);
@@ -230,19 +227,20 @@ fn complete_infinite_iter(cx: &LateContext<'_, '_>, expr: &Expr<'_>) -> Finitene
                 }
             }
             if method.ident.name == sym!(last) && args.len() == 1 {
-                let not_double_ended = get_trait_def_id(cx, &paths::DOUBLE_ENDED_ITERATOR)
-                    .map_or(false, |id| !implements_trait(cx, cx.tables.expr_ty(&args[0]), id, &[]));
+                let not_double_ended = get_trait_def_id(cx, &paths::DOUBLE_ENDED_ITERATOR).map_or(false, |id| {
+                    !implements_trait(cx, cx.typeck_results().expr_ty(&args[0]), id, &[])
+                });
                 if not_double_ended {
                     return is_infinite(cx, &args[0]);
                 }
             } else if method.ident.name == sym!(collect) {
-                let ty = cx.tables.expr_ty(expr);
+                let ty = cx.typeck_results().expr_ty(expr);
                 if INFINITE_COLLECTORS.iter().any(|path| match_type(cx, ty, path)) {
                     return is_infinite(cx, &args[0]);
                 }
             }
         },
-        ExprKind::Binary(op, ref l, ref r) => {
+        ExprKind::Binary(op, l, r) => {
             if op.node.is_comparison() {
                 return is_infinite(cx, l).and(is_infinite(cx, r)).and(MaybeInfinite);
             }

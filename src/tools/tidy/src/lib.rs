@@ -26,6 +26,10 @@ macro_rules! t {
 }
 
 macro_rules! tidy_error {
+    ($bad:expr, $fmt:expr) => ({
+        *$bad = true;
+        eprintln!("tidy error: {}", $fmt);
+    });
     ($bad:expr, $fmt:expr, $($arg:tt)*) => ({
         *$bad = true;
         eprint!("tidy error: ");
@@ -34,7 +38,6 @@ macro_rules! tidy_error {
 }
 
 pub mod bins;
-pub mod cargo;
 pub mod debug_artifacts;
 pub mod deps;
 pub mod edition;
@@ -44,18 +47,23 @@ pub mod extdeps;
 pub mod features;
 pub mod pal;
 pub mod style;
+pub mod target_specific_tests;
 pub mod ui_tests;
 pub mod unit_tests;
 pub mod unstable_book;
 
 fn filter_dirs(path: &Path) -> bool {
     let skip = [
+        "tidy-test-file",
+        "compiler/rustc_codegen_cranelift",
         "src/llvm-project",
-        "src/stdarch",
+        "library/backtrace",
+        "library/stdarch",
         "src/tools/cargo",
         "src/tools/clippy",
         "src/tools/miri",
         "src/tools/rls",
+        "src/tools/rust-analyzer",
         "src/tools/rust-installer",
         "src/tools/rustfmt",
         "src/doc/book",

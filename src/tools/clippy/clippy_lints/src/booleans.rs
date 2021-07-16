@@ -1,7 +1,7 @@
-use crate::utils::{
-    get_trait_def_id, implements_trait, in_macro, is_type_diagnostic_item, paths, snippet_opt, span_lint_and_sugg,
-    span_lint_and_then, SpanlessEq,
-};
+use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then};
+use clippy_utils::source::snippet_opt;
+use clippy_utils::ty::{implements_trait, is_type_diagnostic_item};
+use clippy_utils::{eq_expr_value, get_trait_def_id, in_macro, paths};
 use if_chain::if_chain;
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
@@ -11,6 +11,7 @@ use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::hir::map::Map;
 use rustc_session::{declare_lint_pass, declare_tool_lint};
 use rustc_span::source_map::Span;
+use rustc_span::sym;
 
 declare_clippy_lint! {
     /// **What it does:** Checks for boolean expressions that can be written more
@@ -55,28 +56,28 @@ const METHODS_WITH_NEGATION: [(&str, &str); 2] = [("is_some", "is_none"), ("is_e
 
 declare_lint_pass!(NonminimalBool => [NONMINIMAL_BOOL, LOGIC_BUG]);
 
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NonminimalBool {
+impl<'tcx> LateLintPass<'tcx> for NonminimalBool {
     fn check_fn(
         &mut self,
-        cx: &LateContext<'a, 'tcx>,
+        cx: &LateContext<'tcx>,
         _: FnKind<'tcx>,
         _: &'tcx FnDecl<'_>,
         body: &'tcx Body<'_>,
         _: Span,
         _: HirId,
     ) {
-        NonminimalBoolVisitor { cx }.visit_body(body)
+        NonminimalBoolVisitor { cx }.visit_body(body);
     }
 }
 
 struct NonminimalBoolVisitor<'a, 'tcx> {
-    cx: &'a LateContext<'a, 'tcx>,
+    cx: &'a LateContext<'tcx>,
 }
 
 use quine_mc_cluskey::Bool;
 struct Hir2Qmm<'a, 'tcx, 'v> {
     terminals: Vec<&'v Expr<'v>>,
-    cx: &'a LateContext<'a, 'tcx>,
+    cx: &'a LateContext<'tcx>,
 }
 
 impl<'a, 'tcx, 'v> Hir2Qmm<'a, 'tcx, 'v> {
@@ -109,10 +110,14 @@ impl<'a, 'tcx, 'v> Hir2Qmm<'a, 'tcx, 'v> {
         // prevent folding of `cfg!` macros and the like
         if !e.span.from_expansion() {
             match &e.kind {
-                ExprKind::Unary(UnOp::UnNot, inner) => return Ok(Bool::Not(box self.run(inner)?)),
+                ExprKind::Unary(UnOp::Not, inner) => return Ok(Bool::Not(box self.run(inner)?)),
                 ExprKind::Binary(binop, lhs, rhs) => match &binop.node {
-                    BinOpKind::Or => return Ok(Bool::Or(self.extract(BinOpKind::Or, &[lhs, rhs], Vec::new())?)),
-                    BinOpKind::And => return Ok(Bool::And(self.extract(BinOpKind::And, &[lhs, rhs], Vec::new())?)),
+                    BinOpKind::Or => {
+                        return Ok(Bool::Or(self.extract(BinOpKind::Or, &[lhs, rhs], Vec::new())?));
+                    },
+                    BinOpKind::And => {
+                        return Ok(Bool::And(self.extract(BinOpKind::And, &[lhs, rhs], Vec::new())?));
+                    },
                     _ => (),
                 },
                 ExprKind::Lit(lit) => match lit.node {
@@ -124,7 +129,7 @@ impl<'a, 'tcx, 'v> Hir2Qmm<'a, 'tcx, 'v> {
             }
         }
         for (n, expr) in self.terminals.iter().enumerate() {
-            if SpanlessEq::new(self.cx).ignore_fn().eq_expr(e, expr) {
+            if eq_expr_value(self.cx, e, expr) {
                 #[allow(clippy::cast_possible_truncation)]
                 return Ok(Bool::Term(n as u8));
             }
@@ -134,8 +139,8 @@ impl<'a, 'tcx, 'v> Hir2Qmm<'a, 'tcx, 'v> {
                 if implements_ord(self.cx, e_lhs);
                 if let ExprKind::Binary(expr_binop, expr_lhs, expr_rhs) = &expr.kind;
                 if negate(e_binop.node) == Some(expr_binop.node);
-                if SpanlessEq::new(self.cx).ignore_fn().eq_expr(e_lhs, expr_lhs);
-                if SpanlessEq::new(self.cx).ignore_fn().eq_expr(e_rhs, expr_rhs);
+                if eq_expr_value(self.cx, e_lhs, expr_lhs);
+                if eq_expr_value(self.cx, e_rhs, expr_rhs);
                 then {
                     #[allow(clippy::cast_possible_truncation)]
                     return Ok(Bool::Not(Box::new(Bool::Term(n as u8))));
@@ -155,7 +160,7 @@ impl<'a, 'tcx, 'v> Hir2Qmm<'a, 'tcx, 'v> {
 
 struct SuggestContext<'a, 'tcx, 'v> {
     terminals: &'v [&'v Expr<'v>],
-    cx: &'a LateContext<'a, 'tcx>,
+    cx: &'a LateContext<'tcx>,
     output: String,
 }
 
@@ -179,7 +184,7 @@ impl<'a, 'tcx, 'v> SuggestContext<'a, 'tcx, 'v> {
                 Term(n) => {
                     let terminal = self.terminals[n as usize];
                     if let Some(str) = simplify_not(self.cx, terminal) {
-                        self.output.push_str(&str)
+                        self.output.push_str(&str);
                     } else {
                         self.output.push('!');
                         let snip = snippet_opt(self.cx, terminal.span)?;
@@ -222,7 +227,7 @@ impl<'a, 'tcx, 'v> SuggestContext<'a, 'tcx, 'v> {
     }
 }
 
-fn simplify_not(cx: &LateContext<'_, '_>, expr: &Expr<'_>) -> Option<String> {
+fn simplify_not(cx: &LateContext<'_>, expr: &Expr<'_>) -> Option<String> {
     match &expr.kind {
         ExprKind::Binary(binop, lhs, rhs) => {
             if !implements_ord(cx, lhs) {
@@ -247,16 +252,16 @@ fn simplify_not(cx: &LateContext<'_, '_>, expr: &Expr<'_>) -> Option<String> {
                 ))
             })
         },
-        ExprKind::MethodCall(path, _, args) if args.len() == 1 => {
-            let type_of_receiver = cx.tables.expr_ty(&args[0]);
-            if !is_type_diagnostic_item(cx, type_of_receiver, sym!(option_type))
-                && !is_type_diagnostic_item(cx, type_of_receiver, sym!(result_type))
+        ExprKind::MethodCall(path, _, args, _) if args.len() == 1 => {
+            let type_of_receiver = cx.typeck_results().expr_ty(&args[0]);
+            if !is_type_diagnostic_item(cx, type_of_receiver, sym::option_type)
+                && !is_type_diagnostic_item(cx, type_of_receiver, sym::result_type)
             {
                 return None;
             }
             METHODS_WITH_NEGATION
                 .iter()
-                .cloned()
+                .copied()
                 .flat_map(|(a, b)| vec![(a, b), (b, a)])
                 .find(|&(a, _)| {
                     let path: &str = &path.ident.name.as_str();
@@ -268,7 +273,7 @@ fn simplify_not(cx: &LateContext<'_, '_>, expr: &Expr<'_>) -> Option<String> {
     }
 }
 
-fn suggest(cx: &LateContext<'_, '_>, suggestion: &Bool, terminals: &[&Expr<'_>]) -> String {
+fn suggest(cx: &LateContext<'_>, suggestion: &Bool, terminals: &[&Expr<'_>]) -> String {
     let mut suggest_context = SuggestContext {
         terminals,
         cx,
@@ -447,10 +452,10 @@ impl<'a, 'tcx> Visitor<'tcx> for NonminimalBoolVisitor<'a, 'tcx> {
         }
         match &e.kind {
             ExprKind::Binary(binop, _, _) if binop.node == BinOpKind::Or || binop.node == BinOpKind::And => {
-                self.bool_expr(e)
+                self.bool_expr(e);
             },
-            ExprKind::Unary(UnOp::UnNot, inner) => {
-                if self.cx.tables.node_types()[inner.hir_id].is_bool() {
+            ExprKind::Unary(UnOp::Not, inner) => {
+                if self.cx.typeck_results().node_types()[inner.hir_id].is_bool() {
                     self.bool_expr(e);
                 } else {
                     walk_expr(self, e);
@@ -464,20 +469,20 @@ impl<'a, 'tcx> Visitor<'tcx> for NonminimalBoolVisitor<'a, 'tcx> {
     }
 }
 
-fn implements_ord<'a, 'tcx>(cx: &'a LateContext<'a, 'tcx>, expr: &Expr<'_>) -> bool {
-    let ty = cx.tables.expr_ty(expr);
+fn implements_ord<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'_>) -> bool {
+    let ty = cx.typeck_results().expr_ty(expr);
     get_trait_def_id(cx, &paths::ORD).map_or(false, |id| implements_trait(cx, ty, id, &[]))
 }
 
 struct NotSimplificationVisitor<'a, 'tcx> {
-    cx: &'a LateContext<'a, 'tcx>,
+    cx: &'a LateContext<'tcx>,
 }
 
 impl<'a, 'tcx> Visitor<'tcx> for NotSimplificationVisitor<'a, 'tcx> {
     type Map = Map<'tcx>;
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'_>) {
-        if let ExprKind::Unary(UnOp::UnNot, inner) = &expr.kind {
+        if let ExprKind::Unary(UnOp::Not, inner) = &expr.kind {
             if let Some(suggestion) = simplify_not(self.cx, inner) {
                 span_lint_and_sugg(
                     self.cx,

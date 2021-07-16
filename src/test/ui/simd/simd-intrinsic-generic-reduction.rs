@@ -2,7 +2,6 @@
 #![allow(non_camel_case_types)]
 
 // ignore-emscripten
-// min-system-llvm-version: 9.0
 
 // Test that the simd_reduce_{op} intrinsics produce the correct results.
 
@@ -100,7 +99,7 @@ fn main() {
         let r: u32 = simd_reduce_max(x);
         assert_eq!(r, 4_u32);
 
-        let t = u32::max_value();
+        let t = u32::MAX;
         let x = u32x4(t, t, t, t);
         let r: u32 = simd_reduce_and(x);
         assert_eq!(r, t);

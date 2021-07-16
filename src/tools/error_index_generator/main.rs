@@ -1,8 +1,6 @@
 #![feature(rustc_private)]
-#![deny(warnings)]
 
-extern crate env_logger;
-extern crate rustc_ast;
+extern crate rustc_driver;
 extern crate rustc_span;
 
 use std::cell::RefCell;
@@ -69,6 +67,7 @@ impl Formatter for HTMLFormatter {
 <title>Rust Compiler Error Index</title>
 <meta charset="utf-8">
 <!-- Include rust.css after light.css so its rules take priority. -->
+<link rel="stylesheet" type="text/css" href="rustdoc{suffix}.css"/>
 <link rel="stylesheet" type="text/css" href="light{suffix}.css"/>
 <link rel="stylesheet" type="text/css" href="rust.css"/>
 <style>
@@ -128,7 +127,7 @@ impl Formatter for HTMLFormatter {
                         DEFAULT_EDITION,
                         &Some(playground)
                     )
-                    .to_string()
+                    .into_string()
                 )?
             }
             None => write!(output, "<p>No description.</p>\n")?,
@@ -283,9 +282,10 @@ fn parse_args() -> (OutputFormat, PathBuf) {
 }
 
 fn main() {
-    env_logger::init();
+    rustc_driver::init_env_logger("RUST_LOG");
     let (format, dst) = parse_args();
-    let result = rustc_ast::with_default_globals(move || main_with_result(format, &dst));
+    let result =
+        rustc_span::create_default_session_globals_then(move || main_with_result(format, &dst));
     if let Err(e) = result {
         panic!("{}", e.to_string());
     }
