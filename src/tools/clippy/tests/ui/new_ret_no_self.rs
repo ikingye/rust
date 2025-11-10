@@ -1,3 +1,4 @@
+#![feature(type_alias_impl_trait)]
 #![warn(clippy::new_ret_no_self)]
 #![allow(dead_code)]
 
@@ -47,6 +48,8 @@ impl R for S3 {
 impl S3 {
     // should trigger the lint
     pub fn new(_: String) -> impl R<Item = u32> {
+        //~^ new_ret_no_self
+
         S3
     }
 }
@@ -79,6 +82,8 @@ struct U;
 impl U {
     // should trigger lint
     pub fn new() -> u32 {
+        //~^ new_ret_no_self
+
         unimplemented!();
     }
 }
@@ -88,6 +93,8 @@ struct V;
 impl V {
     // should trigger lint
     pub fn new(_: String) -> u32 {
+        //~^ new_ret_no_self
+
         unimplemented!();
     }
 }
@@ -124,6 +131,8 @@ struct TupleReturnerBad;
 impl TupleReturnerBad {
     // should trigger lint
     pub fn new() -> (u32, u32) {
+        //~^ new_ret_no_self
+
         unimplemented!();
     }
 }
@@ -137,9 +146,9 @@ impl MutPointerReturnerOk {
     }
 }
 
-struct MutPointerReturnerOk2;
+struct ConstPointerReturnerOk2;
 
-impl MutPointerReturnerOk2 {
+impl ConstPointerReturnerOk2 {
     // should not trigger lint
     pub fn new() -> *const Self {
         unimplemented!();
@@ -151,6 +160,8 @@ struct MutPointerReturnerBad;
 impl MutPointerReturnerBad {
     // should trigger lint
     pub fn new() -> *mut V {
+        //~^ new_ret_no_self
+
         unimplemented!();
     }
 }
@@ -169,6 +180,8 @@ struct GenericReturnerBad;
 impl GenericReturnerBad {
     // should trigger lint
     pub fn new() -> Option<u32> {
+        //~^ new_ret_no_self
+
         unimplemented!();
     }
 }
@@ -208,5 +221,201 @@ impl<'a> WithLifetime<'a> {
     // should not trigger the lint, because the lifetimes are different
     pub fn new<'b: 'a>(s: &'b str) -> WithLifetime<'b> {
         unimplemented!();
+    }
+}
+
+mod issue5435 {
+    struct V;
+
+    pub trait TraitRetSelf {
+        // should not trigger lint
+        fn new() -> Self;
+    }
+
+    pub trait TraitRet {
+        // should trigger lint as we are in trait definition
+        fn new() -> String;
+        //~^ new_ret_no_self
+    }
+    pub struct StructRet;
+    impl TraitRet for StructRet {
+        // should not trigger lint as we are in the impl block
+        fn new() -> String {
+            unimplemented!();
+        }
+    }
+
+    pub trait TraitRet2 {
+        // should trigger lint
+        fn new(_: String) -> String;
+        //~^ new_ret_no_self
+    }
+
+    trait TupleReturnerOk {
+        // should not trigger lint
+        fn new() -> (Self, u32)
+        where
+            Self: Sized,
+        {
+            unimplemented!();
+        }
+    }
+
+    trait TupleReturnerOk2 {
+        // should not trigger lint (it doesn't matter which element in the tuple is Self)
+        fn new() -> (u32, Self)
+        where
+            Self: Sized,
+        {
+            unimplemented!();
+        }
+    }
+
+    trait TupleReturnerOk3 {
+        // should not trigger lint (tuple can contain multiple Self)
+        fn new() -> (Self, Self)
+        where
+            Self: Sized,
+        {
+            unimplemented!();
+        }
+    }
+
+    trait TupleReturnerBad {
+        // should trigger lint
+        fn new() -> (u32, u32) {
+            //~^ new_ret_no_self
+
+            unimplemented!();
+        }
+    }
+
+    trait MutPointerReturnerOk {
+        // should not trigger lint
+        fn new() -> *mut Self
+        where
+            Self: Sized,
+        {
+            unimplemented!();
+        }
+    }
+
+    trait ConstPointerReturnerOk2 {
+        // should not trigger lint
+        fn new() -> *const Self
+        where
+            Self: Sized,
+        {
+            unimplemented!();
+        }
+    }
+
+    trait MutPointerReturnerBad {
+        // should trigger lint
+        fn new() -> *mut V {
+            //~^ new_ret_no_self
+
+            unimplemented!();
+        }
+    }
+
+    trait GenericReturnerOk {
+        // should not trigger lint
+        fn new() -> Option<Self>
+        where
+            Self: Sized,
+        {
+            unimplemented!();
+        }
+    }
+
+    trait NestedReturnerOk {
+        // should not trigger lint
+        fn new() -> (Option<Self>, u32)
+        where
+            Self: Sized,
+        {
+            unimplemented!();
+        }
+    }
+
+    trait NestedReturnerOk2 {
+        // should not trigger lint
+        fn new() -> ((Self, u32), u32)
+        where
+            Self: Sized,
+        {
+            unimplemented!();
+        }
+    }
+
+    trait NestedReturnerOk3 {
+        // should not trigger lint
+        fn new() -> Option<(Self, u32)>
+        where
+            Self: Sized,
+        {
+            unimplemented!();
+        }
+    }
+}
+
+// issue #1724
+struct RetOtherSelf<T>(T);
+struct RetOtherSelfWrapper<T>(T);
+
+impl RetOtherSelf<T> {
+    fn new(t: T) -> RetOtherSelf<RetOtherSelfWrapper<T>> {
+        RetOtherSelf(RetOtherSelfWrapper(t))
+    }
+}
+
+mod issue7344 {
+    struct RetImplTraitSelf<T>(T);
+
+    impl<T> RetImplTraitSelf<T> {
+        // should not trigger lint
+        fn new(t: T) -> impl Into<Self> {
+            Self(t)
+        }
+    }
+
+    struct RetImplTraitNoSelf<T>(T);
+
+    impl<T> RetImplTraitNoSelf<T> {
+        // should trigger lint
+        fn new(t: T) -> impl Into<i32> {
+            //~^ new_ret_no_self
+
+            1
+        }
+    }
+
+    trait Trait2<T, U> {}
+    impl<T, U> Trait2<T, U> for () {}
+
+    struct RetImplTraitSelf2<T>(T);
+
+    impl<T> RetImplTraitSelf2<T> {
+        // should not trigger lint
+        fn new(t: T) -> impl Trait2<(), Self> {}
+    }
+
+    struct RetImplTraitNoSelf2<T>(T);
+
+    impl<T> RetImplTraitNoSelf2<T> {
+        // should trigger lint
+        fn new(t: T) -> impl Trait2<(), i32> {
+            //~^ new_ret_no_self
+        }
+    }
+
+    struct RetImplTraitSelfAdt<'a>(&'a str);
+
+    impl<'a> RetImplTraitSelfAdt<'a> {
+        // should not trigger lint
+        fn new<'b: 'a>(s: &'b str) -> impl Into<RetImplTraitSelfAdt<'b>> {
+            RetImplTraitSelfAdt(s)
+        }
     }
 }

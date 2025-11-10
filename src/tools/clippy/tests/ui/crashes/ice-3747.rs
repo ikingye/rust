@@ -1,6 +1,5 @@
-// run-pass
-
-/// Test for https://github.com/rust-lang/rust-clippy/issues/3747
+//@ check-pass
+// Test for https://github.com/rust-lang/rust-clippy/issues/3747
 
 macro_rules! a {
     ( $pub:tt $($attr:tt)* ) => {

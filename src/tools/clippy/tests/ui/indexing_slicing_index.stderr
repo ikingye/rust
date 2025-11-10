@@ -1,79 +1,112 @@
-error: this operation will panic at runtime
-  --> $DIR/indexing_slicing_index.rs:11:5
+error: indexing may panic
+  --> tests/ui/indexing_slicing_index.rs:19:20
    |
-LL |     x[4]; // Ok, let rustc's `const_err` lint handle `usize` indexing on arrays.
-   |     ^^^^ index out of bounds: the len is 4 but the index is 4
+LL | const REF: &i32 = &ARR[idx()]; // This should be linted, since `suppress-restriction-lint-in-const` default is false.
+   |                    ^^^^^^^^^^
    |
-   = note: `#[deny(unconditional_panic)]` on by default
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = note: the suggestion might not be applicable in constant blocks
+   = note: `-D clippy::indexing-slicing` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::indexing_slicing)]`
 
-error: this operation will panic at runtime
-  --> $DIR/indexing_slicing_index.rs:12:5
-   |
-LL |     x[1 << 3]; // Ok, let rustc's `const_err` lint handle `usize` indexing on arrays.
-   |     ^^^^^^^^^ index out of bounds: the len is 4 but the index is 8
-
-error: this operation will panic at runtime
-  --> $DIR/indexing_slicing_index.rs:27:5
-   |
-LL |     x[N]; // Ok, let rustc's `const_err` lint handle `usize` indexing on arrays.
-   |     ^^^^ index out of bounds: the len is 4 but the index is 15
-
-error: indexing may panic.
-  --> $DIR/indexing_slicing_index.rs:10:5
+error: indexing may panic
+  --> tests/ui/indexing_slicing_index.rs:48:5
    |
 LL |     x[index];
    |     ^^^^^^^^
    |
-   = note: `-D clippy::indexing-slicing` implied by `-D warnings`
-   = help: Consider using `.get(n)` or `.get_mut(n)` instead
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
 
-error: indexing may panic.
-  --> $DIR/indexing_slicing_index.rs:18:5
+error: index is out of bounds
+  --> tests/ui/indexing_slicing_index.rs:51:5
    |
-LL |     y[0];
+LL |     x[4];
    |     ^^^^
    |
-   = help: Consider using `.get(n)` or `.get_mut(n)` instead
+   = note: `-D clippy::out-of-bounds-indexing` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::out_of_bounds_indexing)]`
 
-error: indexing may panic.
-  --> $DIR/indexing_slicing_index.rs:21:5
+error: index is out of bounds
+  --> tests/ui/indexing_slicing_index.rs:54:5
+   |
+LL |     x[1 << 3];
+   |     ^^^^^^^^^
+
+error: indexing may panic
+  --> tests/ui/indexing_slicing_index.rs:66:14
+   |
+LL |     const { &ARR[idx()] };
+   |              ^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = note: the suggestion might not be applicable in constant blocks
+
+error: indexing may panic
+  --> tests/ui/indexing_slicing_index.rs:69:14
+   |
+LL |     const { &ARR[idx4()] };
+   |              ^^^^^^^^^^^
+   |
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
+   = note: the suggestion might not be applicable in constant blocks
+
+error: index is out of bounds
+  --> tests/ui/indexing_slicing_index.rs:76:5
+   |
+LL |     y[4];
+   |     ^^^^
+
+error: indexing may panic
+  --> tests/ui/indexing_slicing_index.rs:80:5
    |
 LL |     v[0];
    |     ^^^^
    |
-   = help: Consider using `.get(n)` or `.get_mut(n)` instead
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
 
-error: indexing may panic.
-  --> $DIR/indexing_slicing_index.rs:22:5
+error: indexing may panic
+  --> tests/ui/indexing_slicing_index.rs:82:5
    |
 LL |     v[10];
    |     ^^^^^
    |
-   = help: Consider using `.get(n)` or `.get_mut(n)` instead
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
 
-error: indexing may panic.
-  --> $DIR/indexing_slicing_index.rs:23:5
+error: indexing may panic
+  --> tests/ui/indexing_slicing_index.rs:84:5
    |
 LL |     v[1 << 3];
    |     ^^^^^^^^^
    |
-   = help: Consider using `.get(n)` or `.get_mut(n)` instead
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
 
-error: indexing may panic.
-  --> $DIR/indexing_slicing_index.rs:29:5
+error: index is out of bounds
+  --> tests/ui/indexing_slicing_index.rs:92:5
+   |
+LL |     x[N];
+   |     ^^^^
+
+error: indexing may panic
+  --> tests/ui/indexing_slicing_index.rs:96:5
    |
 LL |     v[N];
    |     ^^^^
    |
-   = help: Consider using `.get(n)` or `.get_mut(n)` instead
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
 
-error: indexing may panic.
-  --> $DIR/indexing_slicing_index.rs:30:5
+error: indexing may panic
+  --> tests/ui/indexing_slicing_index.rs:98:5
    |
 LL |     v[M];
    |     ^^^^
    |
-   = help: Consider using `.get(n)` or `.get_mut(n)` instead
+   = help: consider using `.get(n)` or `.get_mut(n)` instead
 
-error: aborting due to 10 previous errors
+error: index is out of bounds
+  --> tests/ui/indexing_slicing_index.rs:102:13
+   |
+LL |     let _ = x[4];
+   |             ^^^^
+
+error: aborting due to 14 previous errors
 

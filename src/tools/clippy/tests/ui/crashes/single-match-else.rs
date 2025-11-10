@@ -1,4 +1,4 @@
-// run-pass
+//@ check-pass
 
 #![warn(clippy::single_match_else)]
 

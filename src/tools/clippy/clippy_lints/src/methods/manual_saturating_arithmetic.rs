@@ -1,36 +1,36 @@
-use crate::utils::{match_qpath, snippet_with_applicability, span_lint_and_sugg};
-use if_chain::if_chain;
+use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::res::MaybeResPath;
+use clippy_utils::source::snippet_with_applicability;
+use clippy_utils::sym;
 use rustc_ast::ast;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
+use rustc_hir::def::Res;
 use rustc_lint::LateContext;
-use rustc_target::abi::LayoutOf;
+use rustc_middle::ty::layout::LayoutOf;
 
-pub fn lint(cx: &LateContext<'_, '_>, expr: &hir::Expr<'_>, args: &[&[hir::Expr<'_>]], arith: &str) {
-    let unwrap_arg = &args[0][1];
-    let arith_lhs = &args[1][0];
-    let arith_rhs = &args[1][1];
-
-    let ty = cx.tables.expr_ty(arith_lhs);
+pub fn check(
+    cx: &LateContext<'_>,
+    expr: &hir::Expr<'_>,
+    arith_lhs: &hir::Expr<'_>,
+    arith_rhs: &hir::Expr<'_>,
+    unwrap_arg: &hir::Expr<'_>,
+    arith: &str,
+) {
+    let ty = cx.typeck_results().expr_ty(arith_lhs);
     if !ty.is_integral() {
         return;
     }
 
-    let mm = if let Some(mm) = is_min_or_max(cx, unwrap_arg) {
-        mm
-    } else {
+    let Some(mm) = is_min_or_max(cx, unwrap_arg) else {
         return;
     };
 
     if ty.is_signed() {
-        use self::{
-            MinMax::{Max, Min},
-            Sign::{Neg, Pos},
-        };
+        use self::MinMax::{Max, Min};
+        use self::Sign::{Neg, Pos};
 
-        let sign = if let Some(sign) = lit_sign(arith_rhs) {
-            sign
-        } else {
+        let Some(sign) = lit_sign(arith_rhs) else {
             return;
         };
 
@@ -39,44 +39,27 @@ pub fn lint(cx: &LateContext<'_, '_>, expr: &hir::Expr<'_>, args: &[&[hir::Expr<
             // "mul" is omitted because lhs can be negative.
             _ => return,
         }
-
-        let mut applicability = Applicability::MachineApplicable;
-        span_lint_and_sugg(
-            cx,
-            super::MANUAL_SATURATING_ARITHMETIC,
-            expr.span,
-            "manual saturating arithmetic",
-            &format!("try using `saturating_{}`", arith),
-            format!(
-                "{}.saturating_{}({})",
-                snippet_with_applicability(cx, arith_lhs.span, "..", &mut applicability),
-                arith,
-                snippet_with_applicability(cx, arith_rhs.span, "..", &mut applicability),
-            ),
-            applicability,
-        );
     } else {
         match (mm, arith) {
-            (MinMax::Max, "add") | (MinMax::Max, "mul") | (MinMax::Min, "sub") => (),
+            (MinMax::Max, "add" | "mul") | (MinMax::Min, "sub") => (),
             _ => return,
         }
-
-        let mut applicability = Applicability::MachineApplicable;
-        span_lint_and_sugg(
-            cx,
-            super::MANUAL_SATURATING_ARITHMETIC,
-            expr.span,
-            "manual saturating arithmetic",
-            &format!("try using `saturating_{}`", arith),
-            format!(
-                "{}.saturating_{}({})",
-                snippet_with_applicability(cx, arith_lhs.span, "..", &mut applicability),
-                arith,
-                snippet_with_applicability(cx, arith_rhs.span, "..", &mut applicability),
-            ),
-            applicability,
-        );
     }
+
+    let mut applicability = Applicability::MachineApplicable;
+    span_lint_and_sugg(
+        cx,
+        super::MANUAL_SATURATING_ARITHMETIC,
+        expr.span,
+        "manual saturating arithmetic",
+        format!("consider using `saturating_{arith}`"),
+        format!(
+            "{}.saturating_{arith}({})",
+            snippet_with_applicability(cx, arith_lhs.span, "..", &mut applicability),
+            snippet_with_applicability(cx, arith_rhs.span, "..", &mut applicability),
+        ),
+        applicability,
+    );
 }
 
 #[derive(PartialEq, Eq)]
@@ -85,33 +68,28 @@ enum MinMax {
     Max,
 }
 
-fn is_min_or_max<'tcx>(cx: &LateContext<'_, 'tcx>, expr: &hir::Expr<'_>) -> Option<MinMax> {
+fn is_min_or_max(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<MinMax> {
     // `T::max_value()` `T::min_value()` inherent methods
-    if_chain! {
-        if let hir::ExprKind::Call(func, args) = &expr.kind;
-        if args.is_empty();
-        if let hir::ExprKind::Path(path) = &func.kind;
-        if let hir::QPath::TypeRelative(_, segment) = path;
-        then {
-            match &*segment.ident.as_str() {
-                "max_value" => return Some(MinMax::Max),
-                "min_value" => return Some(MinMax::Min),
-                _ => {}
-            }
+    if let hir::ExprKind::Call(func, []) = &expr.kind
+        && let hir::ExprKind::Path(hir::QPath::TypeRelative(_, segment)) = &func.kind
+    {
+        match segment.ident.name {
+            sym::max_value => return Some(MinMax::Max),
+            sym::min_value => return Some(MinMax::Min),
+            _ => {},
         }
     }
 
-    let ty = cx.tables.expr_ty(expr);
-    let ty_str = ty.to_string();
+    let ty = cx.typeck_results().expr_ty(expr);
 
-    // `std::T::MAX` `std::T::MIN` constants
-    if let hir::ExprKind::Path(path) = &expr.kind {
-        if match_qpath(path, &["core", &ty_str, "MAX"][..]) {
-            return Some(MinMax::Max);
-        }
-
-        if match_qpath(path, &["core", &ty_str, "MIN"][..]) {
-            return Some(MinMax::Min);
+    // `T::MAX` and `T::MIN` constants
+    if let hir::ExprKind::Path(hir::QPath::TypeRelative(base, seg)) = expr.kind
+        && matches!(base.basic_res(), Res::PrimTy(_))
+    {
+        match seg.ident.name {
+            sym::MAX => return Some(MinMax::Max),
+            sym::MIN => return Some(MinMax::Min),
+            _ => {},
         }
     }
 
@@ -129,15 +107,15 @@ fn is_min_or_max<'tcx>(cx: &LateContext<'_, 'tcx>, expr: &hir::Expr<'_>) -> Opti
     };
 
     let check_lit = |expr: &hir::Expr<'_>, check_min: bool| {
-        if let hir::ExprKind::Lit(lit) = &expr.kind {
-            if let ast::LitKind::Int(value, _) = lit.node {
-                if value == maxval {
-                    return Some(MinMax::Max);
-                }
+        if let hir::ExprKind::Lit(lit) = &expr.kind
+            && let ast::LitKind::Int(value, _) = lit.node
+        {
+            if value == maxval {
+                return Some(MinMax::Max);
+            }
 
-                if check_min && value == minval {
-                    return Some(MinMax::Min);
-                }
+            if check_min && value == minval {
+                return Some(MinMax::Min);
             }
         }
 
@@ -148,10 +126,10 @@ fn is_min_or_max<'tcx>(cx: &LateContext<'_, 'tcx>, expr: &hir::Expr<'_>) -> Opti
         return r;
     }
 
-    if ty.is_signed() {
-        if let hir::ExprKind::Unary(hir::UnOp::UnNeg, val) = &expr.kind {
-            return check_lit(val, true);
-        }
+    if ty.is_signed()
+        && let hir::ExprKind::Unary(hir::UnOp::Neg, val) = &expr.kind
+    {
+        return check_lit(val, true);
     }
 
     None
@@ -164,7 +142,7 @@ enum Sign {
 }
 
 fn lit_sign(expr: &hir::Expr<'_>) -> Option<Sign> {
-    if let hir::ExprKind::Unary(hir::UnOp::UnNeg, inner) = &expr.kind {
+    if let hir::ExprKind::Unary(hir::UnOp::Neg, inner) = &expr.kind {
         if let hir::ExprKind::Lit(..) = &inner.kind {
             return Some(Sign::Neg);
         }

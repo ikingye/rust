@@ -1,6 +1,5 @@
-// run-pass
-
-/// Test for https://github.com/rust-lang/rust-clippy/issues/1698
+//@ check-pass
+// Test for https://github.com/rust-lang/rust-clippy/issues/1698
 
 pub trait Trait {
     const CONSTANT: u8;

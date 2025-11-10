@@ -1,93 +1,200 @@
-#![warn(clippy::declare_interior_mutable_const)]
+#![deny(clippy::declare_interior_mutable_const)]
+#![allow(clippy::missing_const_for_thread_local)]
 
-use std::borrow::Cow;
-use std::cell::Cell;
-use std::fmt::Display;
-use std::sync::atomic::AtomicUsize;
-use std::sync::Once;
-
-const ATOMIC: AtomicUsize = AtomicUsize::new(5); //~ ERROR interior mutable
-const CELL: Cell<usize> = Cell::new(6); //~ ERROR interior mutable
-const ATOMIC_TUPLE: ([AtomicUsize; 1], Vec<AtomicUsize>, u8) = ([ATOMIC], Vec::new(), 7);
-//~^ ERROR interior mutable
-
-macro_rules! declare_const {
-    ($name:ident: $ty:ty = $e:expr) => {
-        const $name: $ty = $e;
-    };
-}
-declare_const!(_ONCE: Once = Once::new()); //~ ERROR interior mutable
-
-// const ATOMIC_REF: &AtomicUsize = &AtomicUsize::new(7); // This will simply trigger E0492.
-
-const INTEGER: u8 = 8;
-const STRING: String = String::new();
-const STR: &str = "012345";
-const COW: Cow<str> = Cow::Borrowed("abcdef");
-//^ note: a const item of Cow is used in the `postgres` package.
-
-const NO_ANN: &dyn Display = &70;
-
-static STATIC_TUPLE: (AtomicUsize, String) = (ATOMIC, STRING);
-//^ there should be no lints on this line
-
-#[allow(clippy::declare_interior_mutable_const)]
-const ONCE_INIT: Once = Once::new();
-
-trait Trait<T>: Copy {
-    type NonCopyType;
-
-    const ATOMIC: AtomicUsize; //~ ERROR interior mutable
-    const INTEGER: u64;
-    const STRING: String;
-    const SELF: Self; // (no error)
-    const INPUT: T;
-    //~^ ERROR interior mutable
-    //~| HELP consider requiring `T` to be `Copy`
-    const ASSOC: Self::NonCopyType;
-    //~^ ERROR interior mutable
-    //~| HELP consider requiring `<Self as Trait<T>>::NonCopyType` to be `Copy`
-
-    const AN_INPUT: T = Self::INPUT;
-    //~^ ERROR interior mutable
-    //~| ERROR consider requiring `T` to be `Copy`
-    declare_const!(ANOTHER_INPUT: T = Self::INPUT); //~ ERROR interior mutable
-}
-
-trait Trait2 {
-    type CopyType: Copy;
-
-    const SELF_2: Self;
-    //~^ ERROR interior mutable
-    //~| HELP consider requiring `Self` to be `Copy`
-    const ASSOC_2: Self::CopyType; // (no error)
-}
-
-// we don't lint impl of traits, because an impl has no power to change the interface.
-impl Trait<u32> for u64 {
-    type NonCopyType = u16;
-
-    const ATOMIC: AtomicUsize = AtomicUsize::new(9);
-    const INTEGER: u64 = 10;
-    const STRING: String = String::new();
-    const SELF: Self = 11;
-    const INPUT: u32 = 12;
-    const ASSOC: Self::NonCopyType = 13;
-}
-
-struct Local<T, U>(T, U);
-
-impl<T: Trait2 + Trait<u32>, U: Trait2> Local<T, U> {
-    const ASSOC_3: AtomicUsize = AtomicUsize::new(14); //~ ERROR interior mutable
-    const COW: Cow<'static, str> = Cow::Borrowed("tuvwxy");
-    const T_SELF: T = T::SELF_2;
-    const U_SELF: U = U::SELF_2;
-    //~^ ERROR interior mutable
-    //~| HELP consider requiring `U` to be `Copy`
-    const T_ASSOC: T::NonCopyType = T::ASSOC;
-    //~^ ERROR interior mutable
-    //~| HELP consider requiring `<T as Trait<u32>>::NonCopyType` to be `Copy`
-    const U_ASSOC: U::CopyType = U::ASSOC_2;
-}
+use core::cell::{Cell, RefCell, UnsafeCell};
+use core::mem::{ManuallyDrop, MaybeUninit};
+use core::ptr;
+use core::sync::atomic::AtomicUsize;
 
 fn main() {}
+
+const _: Cell<u32> = Cell::new(0);
+const UNSAFE_CELL: UnsafeCell<u32> = UnsafeCell::new(0); //~ declare_interior_mutable_const
+const REF_CELL: RefCell<u32> = RefCell::new(0); //~ declare_interior_mutable_const
+const CELL: Cell<u32> = Cell::new(0); //~ declare_interior_mutable_const
+
+// Constants can't contain pointers or references to type with interior mutability.
+const fn make_ptr() -> *const Cell<u32> {
+    ptr::null()
+}
+const PTR: *const Cell<u32> = make_ptr();
+
+const fn casted_to_cell_ptr() -> *const Cell<u32> {
+    const VALUE: u32 = 0;
+    &VALUE as *const _ as *const Cell<u32>
+}
+const TRANSMUTED_PTR: *const Cell<u32> = casted_to_cell_ptr();
+
+const CELL_TUPLE: (bool, Cell<u32>) = (true, Cell::new(0)); //~ declare_interior_mutable_const
+const CELL_ARRAY: [Cell<u32>; 2] = [Cell::new(0), Cell::new(0)]; //~ declare_interior_mutable_const
+
+const UNINIT_CELL: MaybeUninit<Cell<&'static ()>> = MaybeUninit::uninit();
+
+struct CellStruct {
+    x: u32,
+    cell: Cell<u32>,
+}
+//~v declare_interior_mutable_const
+const CELL_STRUCT: CellStruct = CellStruct {
+    x: 0,
+    cell: Cell::new(0),
+};
+
+enum CellEnum {
+    Cell(Cell<u32>),
+}
+const CELL_ENUM: CellEnum = CellEnum::Cell(Cell::new(0)); //~ declare_interior_mutable_const
+
+const NONE_CELL: Option<Cell<u32>> = None;
+const SOME_CELL: Option<Cell<u32>> = Some(Cell::new(0)); //~ declare_interior_mutable_const
+
+struct NestedCell([(Option<Cell<u32>>,); 1]);
+const NONE_NESTED_CELL: NestedCell = NestedCell([(None,)]);
+const SOME_NESTED_CELL: NestedCell = NestedCell([(Some(Cell::new(0)),)]); //~ declare_interior_mutable_const
+
+union UnionCell {
+    cell: ManuallyDrop<Cell<u32>>,
+    x: u32,
+}
+//~v declare_interior_mutable_const
+const UNION_CELL: UnionCell = UnionCell {
+    cell: ManuallyDrop::new(Cell::new(0)),
+};
+// Access to either union field is valid so we have to be conservative here.
+const UNION_U32: UnionCell = UnionCell { x: 0 }; //~ declare_interior_mutable_const
+
+struct Assoc;
+impl Assoc {
+    const SELF: Self = Self;
+    const CELL: Cell<u32> = Cell::new(0); //~ declare_interior_mutable_const
+}
+
+struct AssocCell(Cell<u32>);
+impl AssocCell {
+    const SELF: Self = Self(Cell::new(0)); //~ declare_interior_mutable_const
+    const NONE_SELF: Option<Self> = None;
+    const SOME_SELF: Option<Self> = Some(Self(Cell::new(0))); //~ declare_interior_mutable_const
+}
+
+trait ConstDefault {
+    // May or may not be `Freeze`
+    const DEFAULT: Self;
+}
+impl ConstDefault for u32 {
+    const DEFAULT: Self = 0;
+}
+impl<T: ConstDefault> ConstDefault for Cell<T> {
+    // Interior mutability is forced by the trait.
+    const DEFAULT: Self = Cell::new(T::DEFAULT);
+}
+impl<T: ConstDefault> ConstDefault for Option<Cell<T>> {
+    // Could have been `None`
+    const DEFAULT: Self = Some(Cell::new(T::DEFAULT)); //~ declare_interior_mutable_const
+}
+
+enum GenericEnumCell<T> {
+    Cell(Cell<T>),
+    Other(T),
+}
+impl<T: ConstDefault> ConstDefault for GenericEnumCell<T> {
+    const DEFAULT: Self = Self::Cell(Cell::new(T::DEFAULT)); //~ declare_interior_mutable_const
+}
+impl<T: ConstDefault> GenericEnumCell<T> {
+    const CELL: Self = Self::DEFAULT; //~ declare_interior_mutable_const
+    const CELL_BY_DEFAULT: Self = Self::Cell(Cell::DEFAULT); //~ declare_interior_mutable_const
+    const OTHER: Self = Self::Other(T::DEFAULT);
+    const FROM_OTHER: Self = Self::OTHER;
+}
+
+enum GenericNestedEnumCell<T> {
+    GenericEnumCell(GenericEnumCell<T>),
+    EnumCell(GenericEnumCell<u32>),
+    Other(T),
+}
+impl<T: ConstDefault> GenericNestedEnumCell<T> {
+    const GENERIC_OTHER: Self = Self::GenericEnumCell(GenericEnumCell::<T>::FROM_OTHER);
+    const GENERIC_CELL: Self = Self::GenericEnumCell(GenericEnumCell::<T>::CELL); //~ declare_interior_mutable_const
+    const ENUM_OTHER: Self = Self::EnumCell(GenericEnumCell::<u32>::FROM_OTHER);
+    const ENUM_CELL: Self = Self::EnumCell(GenericEnumCell::<u32>::CELL); //~ declare_interior_mutable_const
+}
+
+trait CellTrait: ConstDefault + Sized {
+    // Must be non-`Freeze` due to the type
+    const CELL: Cell<Self>; //~ declare_interior_mutable_const
+    // May be non-`Freeze`, but may not be
+    const OPTION_CELL: Option<Cell<Self>>;
+    // May get redefined by the impl, but the default is non-`Freeze`.
+    const SOME_CELL: Option<Cell<Self>> = Some(Cell::new(Self::DEFAULT)); //~ declare_interior_mutable_const
+    // May get redefined by the impl, but the default is `Freeze`.
+    const NONE_CELL: Option<Cell<Self>> = None;
+}
+
+trait CellWithAssoc {
+    type T;
+    const DEFAULT: Self::T;
+    // Must be non-`Freeze` due to the type
+    const CELL: Cell<Self::T>; //~ declare_interior_mutable_const
+    // May be non-`Freeze`, but may not be
+    const OPTION_CELL: Option<Cell<Self::T>>;
+    // May get redefined by the impl, but the default is non-`Freeze`.
+    const SOME_CELL: Option<Cell<Self::T>> = Some(Cell::new(Self::DEFAULT)); //~ declare_interior_mutable_const
+    // May get redefined by the impl, but the default is `Freeze`.
+    const NONE_CELL: Option<Cell<Self::T>> = None;
+}
+
+impl CellWithAssoc for () {
+    type T = u32;
+    const DEFAULT: Self::T = 0;
+    const CELL: Cell<Self::T> = Cell::new(0);
+    const OPTION_CELL: Option<Cell<Self::T>> = None;
+}
+
+trait WithAssoc {
+    type T;
+    const VALUE: Self::T;
+}
+
+impl WithAssoc for u32 {
+    type T = Cell<u32>;
+    // The cell comes from the impl block, not the trait.
+    const VALUE: Self::T = Cell::new(0); //~ declare_interior_mutable_const
+}
+
+trait WithLayeredAssoc {
+    type T: WithAssoc;
+    const VALUE: <Self::T as WithAssoc>::T;
+}
+
+impl WithLayeredAssoc for u32 {
+    type T = u32;
+    // The cell comes from the impl block, not the trait.
+    const VALUE: <Self::T as WithAssoc>::T = Cell::new(0); //~ declare_interior_mutable_const
+}
+
+trait WithGenericAssoc {
+    type T<U>;
+    const VALUE: Self::T<u32>;
+}
+
+impl WithGenericAssoc for u32 {
+    type T<U> = Cell<U>;
+    const VALUE: Self::T<u32> = Cell::new(0); //~ declare_interior_mutable_const
+}
+
+trait WithGenericAssocCell {
+    type T<U>;
+    const VALUE: Self::T<Cell<u32>>;
+}
+
+impl WithGenericAssocCell for u32 {
+    type T<U> = Option<U>;
+    const VALUE: Self::T<Cell<u32>> = None;
+}
+
+impl WithGenericAssocCell for i32 {
+    type T<U> = Option<U>;
+    const VALUE: Self::T<Cell<u32>> = Some(Cell::new(0)); //~ declare_interior_mutable_const
+}
+
+thread_local!(static THREAD_LOCAL_CELL: Cell<u32> = const { Cell::new(0) });
+thread_local!(static THREAD_LOCAL_CELL2: Cell<u32> = Cell::new(0));

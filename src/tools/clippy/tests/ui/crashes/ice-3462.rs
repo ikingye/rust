@@ -1,10 +1,8 @@
-// run-pass
+//@ check-pass
 
-#![warn(clippy::all)]
-#![allow(clippy::blacklisted_name)]
-#![allow(unused)]
+#![expect(clippy::disallowed_names)]
 
-/// Test for https://github.com/rust-lang/rust-clippy/issues/3462
+// Test for https://github.com/rust-lang/rust-clippy/issues/3462
 
 enum Foo {
     Bar,

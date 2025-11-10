@@ -1,203 +1,654 @@
-use std::cell::RefCell;
-use std::default::Default;
-use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::iter::FromIterator;
-use std::num::NonZeroU32;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::{slice, vec};
+use std::hash::Hash;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock as OnceCell};
+use std::{fmt, iter};
 
-use rustc_ast::ast::{self, AttrStyle};
-use rustc_ast::attr;
-use rustc_ast::util::comments::strip_doc_comment_decoration;
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_hir as hir;
-use rustc_hir::def::Res;
-use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
-use rustc_hir::lang_items;
-use rustc_hir::Mutability;
-use rustc_index::vec::IndexVec;
-use rustc_middle::middle::stability;
+use arrayvec::ArrayVec;
+use itertools::Either;
+use rustc_abi::{ExternAbi, VariantIdx};
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
+use rustc_data_structures::thin_vec::ThinVec;
+use rustc_hir::attrs::{AttributeKind, DeprecatedSince, Deprecation};
+use rustc_hir::def::{CtorKind, DefKind, Res};
+use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE, LocalDefId};
+use rustc_hir::lang_items::LangItem;
+use rustc_hir::{BodyId, ConstStability, Mutability, Stability, StableSince, find_attr};
+use rustc_index::IndexVec;
+use rustc_metadata::rendered_const;
+use rustc_middle::span_bug;
+use rustc_middle::ty::fast_reject::SimplifiedType;
+use rustc_middle::ty::{self, TyCtxt, Visibility};
+use rustc_resolve::rustdoc::{
+    DocFragment, add_doc_fragment, attrs_to_doc_fragments, inner_docs, span_of_fragments,
+};
+use rustc_session::Session;
 use rustc_span::hygiene::MacroKind;
-use rustc_span::source_map::DUMMY_SP;
-use rustc_span::symbol::{sym, Ident, Symbol};
-use rustc_span::{self, FileName};
-use rustc_target::abi::VariantIdx;
-use rustc_target::spec::abi::Abi;
+use rustc_span::symbol::{Symbol, kw, sym};
+use rustc_span::{DUMMY_SP, FileName, Loc};
+use tracing::{debug, trace};
+use {rustc_ast as ast, rustc_hir as hir};
 
+pub(crate) use self::ItemKind::*;
+pub(crate) use self::Type::{
+    Array, BareFunction, BorrowedRef, DynTrait, Generic, ImplTrait, Infer, Primitive, QPath,
+    RawPointer, SelfTy, Slice, Tuple, UnsafeBinder,
+};
 use crate::clean::cfg::Cfg;
-use crate::clean::external_path;
-use crate::clean::inline;
-use crate::clean::types::Type::{QPath, ResolvedPath};
+use crate::clean::clean_middle_path;
+use crate::clean::inline::{self, print_inlined_const};
+use crate::clean::utils::{is_literal_expr, print_evaluated_const};
 use crate::core::DocContext;
-use crate::doctree;
-use crate::html::item_type::ItemType;
-use crate::html::render::{cache, ExternalLocation};
+use crate::formats::cache::Cache;
+use crate::formats::item_type::ItemType;
+use crate::html::render::Context;
+use crate::passes::collect_intra_doc_links::UrlFragment;
 
-use self::FnRetTy::*;
-use self::ItemEnum::*;
-use self::SelfTy::*;
-use self::Type::*;
+#[cfg(test)]
+mod tests;
 
-thread_local!(pub static MAX_DEF_ID: RefCell<FxHashMap<CrateNum, DefId>> = Default::default());
+pub(crate) type ItemIdSet = FxHashSet<ItemId>;
 
-#[derive(Clone, Debug)]
-pub struct Crate {
-    pub name: String,
-    pub version: Option<String>,
-    pub src: FileName,
-    pub module: Option<Item>,
-    pub externs: Vec<(CrateNum, ExternalCrate)>,
-    pub primitives: Vec<(DefId, PrimitiveType, Attributes)>,
-    // These are later on moved into `CACHEKEY`, leaving the map empty.
-    // Only here so that they can be filtered through the rustdoc passes.
-    pub external_traits: Rc<RefCell<FxHashMap<DefId, Trait>>>,
-    pub masked_crates: FxHashSet<CrateNum>,
-    pub collapsed: bool,
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+pub(crate) enum ItemId {
+    /// A "normal" item that uses a [`DefId`] for identification.
+    DefId(DefId),
+    /// Identifier that is used for auto traits.
+    Auto { trait_: DefId, for_: DefId },
+    /// Identifier that is used for blanket implementations.
+    Blanket { impl_id: DefId, for_: DefId },
 }
 
-#[derive(Clone, Debug)]
-pub struct ExternalCrate {
-    pub name: String,
-    pub src: FileName,
-    pub attrs: Attributes,
-    pub primitives: Vec<(DefId, PrimitiveType, Attributes)>,
-    pub keywords: Vec<(DefId, String, Attributes)>,
+impl ItemId {
+    #[inline]
+    pub(crate) fn is_local(self) -> bool {
+        match self {
+            ItemId::Auto { for_: id, .. }
+            | ItemId::Blanket { for_: id, .. }
+            | ItemId::DefId(id) => id.is_local(),
+        }
+    }
+
+    #[inline]
+    #[track_caller]
+    pub(crate) fn expect_def_id(self) -> DefId {
+        self.as_def_id()
+            .unwrap_or_else(|| panic!("ItemId::expect_def_id: `{self:?}` isn't a DefId"))
+    }
+
+    #[inline]
+    pub(crate) fn as_def_id(self) -> Option<DefId> {
+        match self {
+            ItemId::DefId(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_local_def_id(self) -> Option<LocalDefId> {
+        self.as_def_id().and_then(|id| id.as_local())
+    }
+
+    #[inline]
+    pub(crate) fn krate(self) -> CrateNum {
+        match self {
+            ItemId::Auto { for_: id, .. }
+            | ItemId::Blanket { for_: id, .. }
+            | ItemId::DefId(id) => id.krate,
+        }
+    }
+}
+
+impl From<DefId> for ItemId {
+    fn from(id: DefId) -> Self {
+        Self::DefId(id)
+    }
+}
+
+/// The crate currently being documented.
+#[derive(Debug)]
+pub(crate) struct Crate {
+    pub(crate) module: Item,
+    /// Only here so that they can be filtered through the rustdoc passes.
+    pub(crate) external_traits: Box<FxIndexMap<DefId, Trait>>,
+}
+
+impl Crate {
+    pub(crate) fn name(&self, tcx: TyCtxt<'_>) -> Symbol {
+        ExternalCrate::LOCAL.name(tcx)
+    }
+
+    pub(crate) fn src(&self, tcx: TyCtxt<'_>) -> FileName {
+        ExternalCrate::LOCAL.src(tcx)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ExternalCrate {
+    pub(crate) crate_num: CrateNum,
+}
+
+impl ExternalCrate {
+    const LOCAL: Self = Self { crate_num: LOCAL_CRATE };
+
+    #[inline]
+    pub(crate) fn def_id(&self) -> DefId {
+        self.crate_num.as_def_id()
+    }
+
+    pub(crate) fn src(&self, tcx: TyCtxt<'_>) -> FileName {
+        let krate_span = tcx.def_span(self.def_id());
+        tcx.sess.source_map().span_to_filename(krate_span)
+    }
+
+    pub(crate) fn name(&self, tcx: TyCtxt<'_>) -> Symbol {
+        tcx.crate_name(self.crate_num)
+    }
+
+    pub(crate) fn src_root(&self, tcx: TyCtxt<'_>) -> PathBuf {
+        match self.src(tcx) {
+            FileName::Real(ref p) => match p.local_path_if_available().parent() {
+                Some(p) => p.to_path_buf(),
+                None => PathBuf::new(),
+            },
+            _ => PathBuf::new(),
+        }
+    }
+
+    /// Attempts to find where an external crate is located, given that we're
+    /// rendering into the specified source destination.
+    pub(crate) fn location(
+        &self,
+        extern_url: Option<&str>,
+        extern_url_takes_precedence: bool,
+        dst: &std::path::Path,
+        tcx: TyCtxt<'_>,
+    ) -> ExternalLocation {
+        use ExternalLocation::*;
+
+        fn to_remote(url: impl ToString) -> ExternalLocation {
+            let mut url = url.to_string();
+            if !url.ends_with('/') {
+                url.push('/');
+            }
+            Remote(url)
+        }
+
+        // See if there's documentation generated into the local directory
+        // WARNING: since rustdoc creates these directories as it generates documentation, this check is only accurate before rendering starts.
+        // Make sure to call `location()` by that time.
+        let local_location = dst.join(self.name(tcx).as_str());
+        if local_location.is_dir() {
+            return Local;
+        }
+
+        if extern_url_takes_precedence && let Some(url) = extern_url {
+            return to_remote(url);
+        }
+
+        // Failing that, see if there's an attribute specifying where to find this
+        // external crate
+        let did = self.crate_num.as_def_id();
+        tcx.get_attrs(did, sym::doc)
+            .flat_map(|attr| attr.meta_item_list().unwrap_or_default())
+            .filter(|a| a.has_name(sym::html_root_url))
+            .filter_map(|a| a.value_str())
+            .map(to_remote)
+            .next()
+            .or_else(|| extern_url.map(to_remote)) // NOTE: only matters if `extern_url_takes_precedence` is false
+            .unwrap_or(Unknown) // Well, at least we tried.
+    }
+
+    fn mapped_root_modules<T>(
+        &self,
+        tcx: TyCtxt<'_>,
+        f: impl Fn(DefId, TyCtxt<'_>) -> Option<(DefId, T)>,
+    ) -> impl Iterator<Item = (DefId, T)> {
+        let root = self.def_id();
+
+        if root.is_local() {
+            Either::Left(
+                tcx.hir_root_module()
+                    .item_ids
+                    .iter()
+                    .filter(move |&&id| matches!(tcx.hir_item(id).kind, hir::ItemKind::Mod(..)))
+                    .filter_map(move |&id| f(id.owner_id.into(), tcx)),
+            )
+        } else {
+            Either::Right(
+                tcx.module_children(root)
+                    .iter()
+                    .filter_map(|item| {
+                        if let Res::Def(DefKind::Mod, did) = item.res { Some(did) } else { None }
+                    })
+                    .filter_map(move |did| f(did, tcx)),
+            )
+        }
+    }
+
+    pub(crate) fn keywords(&self, tcx: TyCtxt<'_>) -> impl Iterator<Item = (DefId, Symbol)> {
+        self.retrieve_keywords_or_documented_attributes(tcx, sym::keyword)
+    }
+    pub(crate) fn documented_attributes(
+        &self,
+        tcx: TyCtxt<'_>,
+    ) -> impl Iterator<Item = (DefId, Symbol)> {
+        self.retrieve_keywords_or_documented_attributes(tcx, sym::attribute)
+    }
+
+    fn retrieve_keywords_or_documented_attributes(
+        &self,
+        tcx: TyCtxt<'_>,
+        name: Symbol,
+    ) -> impl Iterator<Item = (DefId, Symbol)> {
+        let as_target = move |did: DefId, tcx: TyCtxt<'_>| -> Option<(DefId, Symbol)> {
+            tcx.get_attrs(did, sym::doc)
+                .flat_map(|attr| attr.meta_item_list().unwrap_or_default())
+                .filter(|meta| meta.has_name(name))
+                .find_map(|meta| meta.value_str())
+                .map(|value| (did, value))
+        };
+        self.mapped_root_modules(tcx, as_target)
+    }
+
+    pub(crate) fn primitives(
+        &self,
+        tcx: TyCtxt<'_>,
+    ) -> impl Iterator<Item = (DefId, PrimitiveType)> {
+        // Collect all inner modules which are tagged as implementations of
+        // primitives.
+        //
+        // Note that this loop only searches the top-level items of the crate,
+        // and this is intentional. If we were to search the entire crate for an
+        // item tagged with `#[rustc_doc_primitive]` then we would also have to
+        // search the entirety of external modules for items tagged
+        // `#[rustc_doc_primitive]`, which is a pretty inefficient process (decoding
+        // all that metadata unconditionally).
+        //
+        // In order to keep the metadata load under control, the
+        // `#[rustc_doc_primitive]` feature is explicitly designed to only allow the
+        // primitive tags to show up as the top level items in a crate.
+        //
+        // Also note that this does not attempt to deal with modules tagged
+        // duplicately for the same primitive. This is handled later on when
+        // rendering by delegating everything to a hash map.
+        fn as_primitive(def_id: DefId, tcx: TyCtxt<'_>) -> Option<(DefId, PrimitiveType)> {
+            tcx.get_attrs(def_id, sym::rustc_doc_primitive).next().map(|attr| {
+                let attr_value = attr.value_str().expect("syntax should already be validated");
+                let Some(prim) = PrimitiveType::from_symbol(attr_value) else {
+                    span_bug!(
+                        attr.span(),
+                        "primitive `{attr_value}` is not a member of `PrimitiveType`"
+                    );
+                };
+
+                (def_id, prim)
+            })
+        }
+
+        self.mapped_root_modules(tcx, as_primitive)
+    }
+}
+
+/// Indicates where an external crate can be found.
+#[derive(Debug)]
+pub(crate) enum ExternalLocation {
+    /// Remote URL root of the external crate
+    Remote(String),
+    /// This external crate can be found in the local doc/ folder
+    Local,
+    /// The external crate could not be found.
+    Unknown,
 }
 
 /// Anything with a source location and set of attributes and, optionally, a
 /// name. That is, anything that can be documented. This doesn't correspond
 /// directly to the AST's concept of an item; it's a strict superset.
 #[derive(Clone)]
-pub struct Item {
-    /// Stringified span
-    pub source: Span,
-    /// Not everything has a name. E.g., impls
-    pub name: Option<String>,
-    pub attrs: Attributes,
-    pub inner: ItemEnum,
-    pub visibility: Visibility,
-    pub def_id: DefId,
-    pub stability: Option<Stability>,
-    pub deprecation: Option<Deprecation>,
+pub(crate) struct Item {
+    pub(crate) inner: Box<ItemInner>,
 }
 
-impl fmt::Debug for Item {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let fake = MAX_DEF_ID.with(|m| {
-            m.borrow().get(&self.def_id.krate).map(|id| self.def_id >= *id).unwrap_or(false)
-        });
-        let def_id: &dyn fmt::Debug = if fake { &"**FAKE**" } else { &self.def_id };
+// Why does the `Item`/`ItemInner` split exist? `Vec<Item>`s are common, and
+// without the split `Item` would be a large type (100+ bytes) which results in
+// lots of wasted space in the unused parts of a `Vec<Item>`. With the split,
+// `Item` is just 8 bytes, and the wasted space is avoided, at the cost of an
+// extra allocation per item. This is a performance win.
+#[derive(Clone)]
+pub(crate) struct ItemInner {
+    /// The name of this item.
+    /// Optional because not every item has a name, e.g. impls.
+    pub(crate) name: Option<Symbol>,
+    /// Information about this item that is specific to what kind of item it is.
+    /// E.g., struct vs enum vs function.
+    pub(crate) kind: ItemKind,
+    pub(crate) attrs: Attributes,
+    /// The effective stability, filled out by the `propagate-stability` pass.
+    pub(crate) stability: Option<Stability>,
+    pub(crate) item_id: ItemId,
+    /// This is the `LocalDefId` of the `use` statement if the item was inlined.
+    /// The crate metadata doesn't hold this information, so the `use` statement
+    /// always belongs to the current crate.
+    pub(crate) inline_stmt_id: Option<LocalDefId>,
+    pub(crate) cfg: Option<Arc<Cfg>>,
+}
 
-        fmt.debug_struct("Item")
-            .field("source", &self.source)
-            .field("name", &self.name)
-            .field("attrs", &self.attrs)
-            .field("inner", &self.inner)
-            .field("visibility", &self.visibility)
-            .field("def_id", def_id)
-            .field("stability", &self.stability)
-            .field("deprecation", &self.deprecation)
-            .finish()
+impl std::ops::Deref for Item {
+    type Target = ItemInner;
+    fn deref(&self) -> &ItemInner {
+        &self.inner
+    }
+}
+
+/// NOTE: this does NOT unconditionally print every item, to avoid thousands of lines of logs.
+/// If you want to see the debug output for attributes and the `kind` as well, use `{:#?}` instead of `{:?}`.
+impl fmt::Debug for Item {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let alternate = f.alternate();
+        // hand-picked fields that don't bloat the logs too much
+        let mut fmt = f.debug_struct("Item");
+        fmt.field("name", &self.name).field("item_id", &self.item_id);
+        // allow printing the full item if someone really wants to
+        if alternate {
+            fmt.field("attrs", &self.attrs).field("kind", &self.kind).field("cfg", &self.cfg);
+        } else {
+            fmt.field("kind", &self.type_());
+            fmt.field("docs", &self.doc_value());
+        }
+        fmt.finish()
+    }
+}
+
+pub(crate) fn rustc_span(def_id: DefId, tcx: TyCtxt<'_>) -> Span {
+    Span::new(def_id.as_local().map_or_else(
+        || tcx.def_span(def_id),
+        |local| tcx.hir_span_with_body(tcx.local_def_id_to_hir_id(local)),
+    ))
+}
+
+fn is_field_vis_inherited(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    let parent = tcx.parent(def_id);
+    match tcx.def_kind(parent) {
+        DefKind::Struct | DefKind::Union => false,
+        DefKind::Variant => true,
+        parent_kind => panic!("unexpected parent kind: {parent_kind:?}"),
     }
 }
 
 impl Item {
-    /// Finds the `doc` attribute as a NameValue and returns the corresponding
-    /// value found.
-    pub fn doc_value(&self) -> Option<&str> {
+    /// Returns the effective stability of the item.
+    ///
+    /// This method should only be called after the `propagate-stability` pass has been run.
+    pub(crate) fn stability(&self, tcx: TyCtxt<'_>) -> Option<Stability> {
+        let stability = self.inner.stability;
+        debug_assert!(
+            stability.is_some()
+                || self.def_id().is_none_or(|did| tcx.lookup_stability(did).is_none()),
+            "missing stability for cleaned item: {self:?}",
+        );
+        stability
+    }
+
+    pub(crate) fn const_stability(&self, tcx: TyCtxt<'_>) -> Option<ConstStability> {
+        self.def_id().and_then(|did| tcx.lookup_const_stability(did))
+    }
+
+    pub(crate) fn deprecation(&self, tcx: TyCtxt<'_>) -> Option<Deprecation> {
+        self.def_id().and_then(|did| tcx.lookup_deprecation(did)).or_else(|| {
+            // `allowed_through_unstable_modules` is a bug-compatibility hack for old rustc
+            // versions; the paths that are exposed through it are "deprecated" because they
+            // were never supposed to work at all.
+            let stab = self.stability(tcx)?;
+            if let rustc_hir::StabilityLevel::Stable {
+                allowed_through_unstable_modules: Some(note),
+                ..
+            } = stab.level
+            {
+                Some(Deprecation {
+                    since: DeprecatedSince::Unspecified,
+                    note: Some(note),
+                    suggestion: None,
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    pub(crate) fn inner_docs(&self, tcx: TyCtxt<'_>) -> bool {
+        self.item_id.as_def_id().map(|did| inner_docs(tcx.get_all_attrs(did))).unwrap_or(false)
+    }
+
+    pub(crate) fn span(&self, tcx: TyCtxt<'_>) -> Option<Span> {
+        let kind = match &self.kind {
+            ItemKind::StrippedItem(k) => k,
+            _ => &self.kind,
+        };
+        match kind {
+            ItemKind::ModuleItem(Module { span, .. }) => Some(*span),
+            ItemKind::ImplItem(box Impl { kind: ImplKind::Auto, .. }) => None,
+            ItemKind::ImplItem(box Impl { kind: ImplKind::Blanket(_), .. }) => {
+                if let ItemId::Blanket { impl_id, .. } = self.item_id {
+                    Some(rustc_span(impl_id, tcx))
+                } else {
+                    panic!("blanket impl item has non-blanket ID")
+                }
+            }
+            _ => self.def_id().map(|did| rustc_span(did, tcx)),
+        }
+    }
+
+    pub(crate) fn attr_span(&self, tcx: TyCtxt<'_>) -> rustc_span::Span {
+        span_of_fragments(&self.attrs.doc_strings)
+            .unwrap_or_else(|| self.span(tcx).map_or(DUMMY_SP, |span| span.inner()))
+    }
+
+    /// Combine all doc strings into a single value handling indentation and newlines as needed.
+    pub(crate) fn doc_value(&self) -> String {
         self.attrs.doc_value()
     }
 
-    /// Finds all `doc` attributes as NameValues and returns their corresponding values, joined
-    /// with newlines.
-    pub fn collapsed_doc_value(&self) -> Option<String> {
-        self.attrs.collapsed_doc_value()
+    /// Combine all doc strings into a single value handling indentation and newlines as needed.
+    /// Returns `None` is there's no documentation at all, and `Some("")` if there is some
+    /// documentation but it is empty (e.g. `#[doc = ""]`).
+    pub(crate) fn opt_doc_value(&self) -> Option<String> {
+        self.attrs.opt_doc_value()
     }
 
-    pub fn links(&self) -> Vec<(String, String)> {
-        self.attrs.links(&self.def_id.krate)
+    pub(crate) fn from_def_id_and_parts(
+        def_id: DefId,
+        name: Option<Symbol>,
+        kind: ItemKind,
+        cx: &mut DocContext<'_>,
+    ) -> Item {
+        let hir_attrs = cx.tcx.get_all_attrs(def_id);
+
+        Self::from_def_id_and_attrs_and_parts(
+            def_id,
+            name,
+            kind,
+            Attributes::from_hir(hir_attrs),
+            None,
+        )
     }
 
-    pub fn is_crate(&self) -> bool {
-        match self.inner {
-            StrippedItem(box ModuleItem(Module { is_crate: true, .. }))
-            | ModuleItem(Module { is_crate: true, .. }) => true,
-            _ => false,
+    pub(crate) fn from_def_id_and_attrs_and_parts(
+        def_id: DefId,
+        name: Option<Symbol>,
+        kind: ItemKind,
+        attrs: Attributes,
+        cfg: Option<Arc<Cfg>>,
+    ) -> Item {
+        trace!("name={name:?}, def_id={def_id:?} cfg={cfg:?}");
+
+        Item {
+            inner: Box::new(ItemInner {
+                item_id: def_id.into(),
+                kind,
+                attrs,
+                stability: None,
+                name,
+                cfg,
+                inline_stmt_id: None,
+            }),
         }
     }
-    pub fn is_mod(&self) -> bool {
+
+    /// If the item has doc comments from a reexport, returns the item id of that reexport,
+    /// otherwise returns returns the item id.
+    ///
+    /// This is used as a key for caching intra-doc link resolution,
+    /// to prevent two reexports of the same item from using the same cache.
+    pub(crate) fn item_or_reexport_id(&self) -> ItemId {
+        // added documentation on a reexport is always prepended.
+        self.attrs
+            .doc_strings
+            .first()
+            .map(|x| x.item_id)
+            .flatten()
+            .map(ItemId::from)
+            .unwrap_or(self.item_id)
+    }
+
+    pub(crate) fn links(&self, cx: &Context<'_>) -> Vec<RenderedLink> {
+        use crate::html::format::{href, link_tooltip};
+
+        let Some(links) = cx.cache().intra_doc_links.get(&self.item_or_reexport_id()) else {
+            return vec![];
+        };
+        links
+            .iter()
+            .filter_map(|ItemLink { link: s, link_text, page_id: id, fragment }| {
+                debug!(?id);
+                if let Ok((mut href, ..)) = href(*id, cx) {
+                    debug!(?href);
+                    if let Some(ref fragment) = *fragment {
+                        fragment.render(&mut href, cx.tcx())
+                    }
+                    Some(RenderedLink {
+                        original_text: s.clone(),
+                        new_text: link_text.clone(),
+                        tooltip: link_tooltip(*id, fragment, cx).to_string(),
+                        href,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Find a list of all link names, without finding their href.
+    ///
+    /// This is used for generating summary text, which does not include
+    /// the link text, but does need to know which `[]`-bracketed names
+    /// are actually links.
+    pub(crate) fn link_names(&self, cache: &Cache) -> Vec<RenderedLink> {
+        let Some(links) = cache.intra_doc_links.get(&self.item_id) else {
+            return vec![];
+        };
+        links
+            .iter()
+            .map(|ItemLink { link: s, link_text, .. }| RenderedLink {
+                original_text: s.clone(),
+                new_text: link_text.clone(),
+                href: String::new(),
+                tooltip: String::new(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn is_crate(&self) -> bool {
+        self.is_mod() && self.def_id().is_some_and(|did| did.is_crate_root())
+    }
+    pub(crate) fn is_mod(&self) -> bool {
         self.type_() == ItemType::Module
     }
-    pub fn is_trait(&self) -> bool {
-        self.type_() == ItemType::Trait
-    }
-    pub fn is_struct(&self) -> bool {
+    pub(crate) fn is_struct(&self) -> bool {
         self.type_() == ItemType::Struct
     }
-    pub fn is_enum(&self) -> bool {
+    pub(crate) fn is_enum(&self) -> bool {
         self.type_() == ItemType::Enum
     }
-    pub fn is_variant(&self) -> bool {
+    pub(crate) fn is_variant(&self) -> bool {
         self.type_() == ItemType::Variant
     }
-    pub fn is_associated_type(&self) -> bool {
-        self.type_() == ItemType::AssocType
+    pub(crate) fn is_associated_type(&self) -> bool {
+        matches!(self.kind, AssocTypeItem(..) | StrippedItem(box AssocTypeItem(..)))
     }
-    pub fn is_associated_const(&self) -> bool {
-        self.type_() == ItemType::AssocConst
+    pub(crate) fn is_required_associated_type(&self) -> bool {
+        matches!(self.kind, RequiredAssocTypeItem(..) | StrippedItem(box RequiredAssocTypeItem(..)))
     }
-    pub fn is_method(&self) -> bool {
+    pub(crate) fn is_associated_const(&self) -> bool {
+        matches!(self.kind, ProvidedAssocConstItem(..) | ImplAssocConstItem(..) | StrippedItem(box (ProvidedAssocConstItem(..) | ImplAssocConstItem(..))))
+    }
+    pub(crate) fn is_required_associated_const(&self) -> bool {
+        matches!(self.kind, RequiredAssocConstItem(..) | StrippedItem(box RequiredAssocConstItem(..)))
+    }
+    pub(crate) fn is_method(&self) -> bool {
         self.type_() == ItemType::Method
     }
-    pub fn is_ty_method(&self) -> bool {
+    pub(crate) fn is_ty_method(&self) -> bool {
         self.type_() == ItemType::TyMethod
     }
-    pub fn is_typedef(&self) -> bool {
-        self.type_() == ItemType::Typedef
-    }
-    pub fn is_primitive(&self) -> bool {
+    pub(crate) fn is_primitive(&self) -> bool {
         self.type_() == ItemType::Primitive
     }
-    pub fn is_union(&self) -> bool {
+    pub(crate) fn is_union(&self) -> bool {
         self.type_() == ItemType::Union
     }
-    pub fn is_import(&self) -> bool {
+    pub(crate) fn is_import(&self) -> bool {
         self.type_() == ItemType::Import
     }
-    pub fn is_extern_crate(&self) -> bool {
+    pub(crate) fn is_extern_crate(&self) -> bool {
         self.type_() == ItemType::ExternCrate
     }
-    pub fn is_keyword(&self) -> bool {
+    pub(crate) fn is_keyword(&self) -> bool {
         self.type_() == ItemType::Keyword
     }
-    pub fn is_stripped(&self) -> bool {
-        match self.inner {
+    pub(crate) fn is_attribute(&self) -> bool {
+        self.type_() == ItemType::Attribute
+    }
+    /// Returns `true` if the item kind is one of the following:
+    ///
+    /// * `ItemType::Primitive`
+    /// * `ItemType::Keyword`
+    /// * `ItemType::Attribute`
+    ///
+    /// They are considered fake because they only exist thanks to their
+    /// `#[doc(primitive|keyword|attribute)]` attribute.
+    pub(crate) fn is_fake_item(&self) -> bool {
+        matches!(self.type_(), ItemType::Primitive | ItemType::Keyword | ItemType::Attribute)
+    }
+    pub(crate) fn is_stripped(&self) -> bool {
+        match self.kind {
             StrippedItem(..) => true,
+            ImportItem(ref i) => !i.should_be_displayed,
             _ => false,
         }
     }
-    pub fn has_stripped_fields(&self) -> Option<bool> {
-        match self.inner {
-            StructItem(ref _struct) => Some(_struct.fields_stripped),
-            UnionItem(ref union) => Some(union.fields_stripped),
-            VariantItem(Variant { kind: VariantKind::Struct(ref vstruct) }) => {
-                Some(vstruct.fields_stripped)
+    pub(crate) fn has_stripped_entries(&self) -> Option<bool> {
+        match self.kind {
+            StructItem(ref struct_) => Some(struct_.has_stripped_entries()),
+            UnionItem(ref union_) => Some(union_.has_stripped_entries()),
+            EnumItem(ref enum_) => Some(enum_.has_stripped_entries()),
+            VariantItem(ref v) => v.has_stripped_entries(),
+            TypeAliasItem(ref type_alias) => {
+                type_alias.inner_type.as_ref().and_then(|t| t.has_stripped_entries())
             }
             _ => None,
         }
     }
 
-    pub fn stability_class(&self) -> Option<String> {
-        self.stability.as_ref().and_then(|ref s| {
+    pub(crate) fn stability_class(&self, tcx: TyCtxt<'_>) -> Option<String> {
+        self.stability(tcx).as_ref().and_then(|s| {
             let mut classes = Vec::with_capacity(2);
 
-            if s.level == stability::Unstable {
+            if s.is_unstable() {
                 classes.push("unstable");
             }
 
-            if s.deprecation.is_some() {
+            // FIXME: what about non-staged API items that are deprecated?
+            if self.deprecation(tcx).is_some() {
                 classes.push("deprecated");
             }
 
@@ -205,528 +656,476 @@ impl Item {
         })
     }
 
-    pub fn stable_since(&self) -> Option<&str> {
-        self.stability.as_ref().map(|s| &s.since[..])
+    pub(crate) fn stable_since(&self, tcx: TyCtxt<'_>) -> Option<StableSince> {
+        self.stability(tcx).and_then(|stability| stability.stable_since())
     }
 
-    pub fn is_non_exhaustive(&self) -> bool {
-        self.attrs.other_attrs.iter().any(|a| a.check_name(sym::non_exhaustive))
+    pub(crate) fn is_non_exhaustive(&self) -> bool {
+        find_attr!(&self.attrs.other_attrs, AttributeKind::NonExhaustive(..))
     }
 
     /// Returns a documentation-level item type from the item.
-    pub fn type_(&self) -> ItemType {
+    pub(crate) fn type_(&self) -> ItemType {
         ItemType::from(self)
     }
 
-    /// Returns the info in the item's `#[deprecated]` or `#[rustc_deprecated]` attributes.
-    ///
-    /// If the item is not deprecated, returns `None`.
-    pub fn deprecation(&self) -> Option<&Deprecation> {
-        self.deprecation
-            .as_ref()
-            .or_else(|| self.stability.as_ref().and_then(|s| s.deprecation.as_ref()))
-    }
-    pub fn is_default(&self) -> bool {
-        match self.inner {
-            ItemEnum::MethodItem(ref meth) => {
-                if let Some(defaultness) = meth.defaultness {
-                    defaultness.has_value() && !defaultness.is_final()
-                } else {
-                    false
-                }
+    pub(crate) fn is_default(&self) -> bool {
+        match self.kind {
+            ItemKind::MethodItem(_, Some(defaultness)) => {
+                defaultness.has_value() && !defaultness.is_final()
             }
             _ => false,
         }
     }
+
+    /// Returns a `FnHeader` if `self` is a function item, otherwise returns `None`.
+    pub(crate) fn fn_header(&self, tcx: TyCtxt<'_>) -> Option<hir::FnHeader> {
+        fn build_fn_header(
+            def_id: DefId,
+            tcx: TyCtxt<'_>,
+            asyncness: ty::Asyncness,
+        ) -> hir::FnHeader {
+            let sig = tcx.fn_sig(def_id).skip_binder();
+            let constness = if tcx.is_const_fn(def_id) {
+                // rustc's `is_const_fn` returns `true` for associated functions that have an `impl const` parent
+                // or that have a `const trait` parent. Do not display those as `const` in rustdoc because we
+                // won't be printing correct syntax plus the syntax is unstable.
+                if let Some(assoc) = tcx.opt_associated_item(def_id)
+                    && let ty::AssocContainer::Trait | ty::AssocContainer::TraitImpl(_) =
+                        assoc.container
+                {
+                    hir::Constness::NotConst
+                } else {
+                    hir::Constness::Const
+                }
+            } else {
+                hir::Constness::NotConst
+            };
+            let asyncness = match asyncness {
+                ty::Asyncness::Yes => hir::IsAsync::Async(DUMMY_SP),
+                ty::Asyncness::No => hir::IsAsync::NotAsync,
+            };
+            hir::FnHeader {
+                safety: if tcx.codegen_fn_attrs(def_id).safe_target_features {
+                    hir::HeaderSafety::SafeTargetFeatures
+                } else {
+                    sig.safety().into()
+                },
+                abi: sig.abi(),
+                constness,
+                asyncness,
+            }
+        }
+        let header = match self.kind {
+            ItemKind::ForeignFunctionItem(_, safety) => {
+                let def_id = self.def_id().unwrap();
+                let abi = tcx.fn_sig(def_id).skip_binder().abi();
+                hir::FnHeader {
+                    safety: if tcx.codegen_fn_attrs(def_id).safe_target_features {
+                        hir::HeaderSafety::SafeTargetFeatures
+                    } else {
+                        safety.into()
+                    },
+                    abi,
+                    constness: if tcx.is_const_fn(def_id) {
+                        hir::Constness::Const
+                    } else {
+                        hir::Constness::NotConst
+                    },
+                    asyncness: hir::IsAsync::NotAsync,
+                }
+            }
+            ItemKind::FunctionItem(_)
+            | ItemKind::MethodItem(_, _)
+            | ItemKind::RequiredMethodItem(_) => {
+                let def_id = self.def_id().unwrap();
+                build_fn_header(def_id, tcx, tcx.asyncness(def_id))
+            }
+            _ => return None,
+        };
+        Some(header)
+    }
+
+    /// Returns the visibility of the current item. If the visibility is "inherited", then `None`
+    /// is returned.
+    pub(crate) fn visibility(&self, tcx: TyCtxt<'_>) -> Option<Visibility<DefId>> {
+        let def_id = match self.item_id {
+            // Anything but DefId *shouldn't* matter, but return a reasonable value anyway.
+            ItemId::Auto { .. } | ItemId::Blanket { .. } => return None,
+            ItemId::DefId(def_id) => def_id,
+        };
+
+        match self.kind {
+            // Primitives and Keywords are written in the source code as private modules.
+            // The modules need to be private so that nobody actually uses them, but the
+            // keywords and primitives that they are documenting are public.
+            ItemKind::KeywordItem | ItemKind::PrimitiveItem(_) | ItemKind::AttributeItem => {
+                return Some(Visibility::Public);
+            }
+            // Variant fields inherit their enum's visibility.
+            StructFieldItem(..) if is_field_vis_inherited(tcx, def_id) => {
+                return None;
+            }
+            // Variants always inherit visibility
+            VariantItem(..) | ImplItem(..) => return None,
+            // Trait items inherit the trait's visibility
+            RequiredAssocConstItem(..)
+            | ProvidedAssocConstItem(..)
+            | ImplAssocConstItem(..)
+            | AssocTypeItem(..)
+            | RequiredAssocTypeItem(..)
+            | RequiredMethodItem(..)
+            | MethodItem(..) => {
+                match tcx.associated_item(def_id).container {
+                    // Trait impl items always inherit the impl's visibility --
+                    // we don't want to show `pub`.
+                    ty::AssocContainer::Trait | ty::AssocContainer::TraitImpl(_) => {
+                        return None;
+                    }
+                    ty::AssocContainer::InherentImpl => {}
+                }
+            }
+            _ => {}
+        }
+        let def_id = match self.inline_stmt_id {
+            Some(inlined) => inlined.to_def_id(),
+            None => def_id,
+        };
+        Some(tcx.visibility(def_id))
+    }
+
+    pub fn is_doc_hidden(&self) -> bool {
+        self.attrs.is_doc_hidden()
+    }
+
+    pub fn def_id(&self) -> Option<DefId> {
+        self.item_id.as_def_id()
+    }
 }
 
 #[derive(Clone, Debug)]
-pub enum ItemEnum {
-    ExternCrateItem(String, Option<String>),
+pub(crate) enum ItemKind {
+    ExternCrateItem {
+        /// The crate's name, *not* the name it's imported as.
+        src: Option<Symbol>,
+    },
     ImportItem(Import),
     StructItem(Struct),
     UnionItem(Union),
     EnumItem(Enum),
-    FunctionItem(Function),
+    FunctionItem(Box<Function>),
     ModuleItem(Module),
-    TypedefItem(Typedef, bool /* is associated type */),
-    OpaqueTyItem(OpaqueTy, bool /* is associated type */),
+    TypeAliasItem(Box<TypeAlias>),
     StaticItem(Static),
-    ConstantItem(Constant),
-    TraitItem(Trait),
+    TraitItem(Box<Trait>),
     TraitAliasItem(TraitAlias),
-    ImplItem(Impl),
-    /// A method signature only. Used for required methods in traits (ie,
-    /// non-default-methods).
-    TyMethodItem(TyMethod),
-    /// A method with a body.
-    MethodItem(Method),
+    ImplItem(Box<Impl>),
+    /// A required method in a trait declaration meaning it's only a function signature.
+    RequiredMethodItem(Box<Function>),
+    /// A method in a trait impl or a provided method in a trait declaration.
+    ///
+    /// Compared to [RequiredMethodItem], it also contains a method body.
+    MethodItem(Box<Function>, Option<hir::Defaultness>),
     StructFieldItem(Type),
     VariantItem(Variant),
     /// `fn`s from an extern block
-    ForeignFunctionItem(Function),
+    ForeignFunctionItem(Box<Function>, hir::Safety),
     /// `static`s from an extern block
-    ForeignStaticItem(Static),
+    ForeignStaticItem(Static, hir::Safety),
     /// `type`s from an extern block
     ForeignTypeItem,
     MacroItem(Macro),
     ProcMacroItem(ProcMacro),
     PrimitiveItem(PrimitiveType),
-    AssocConstItem(Type, Option<String>),
-    AssocTypeItem(Vec<GenericBound>, Option<Type>),
+    /// A required associated constant in a trait declaration.
+    RequiredAssocConstItem(Generics, Box<Type>),
+    ConstantItem(Box<Constant>),
+    /// An associated constant in a trait declaration with provided default value.
+    ProvidedAssocConstItem(Box<Constant>),
+    /// An associated constant in an inherent impl or trait impl.
+    ImplAssocConstItem(Box<Constant>),
+    /// A required associated type in a trait declaration.
+    ///
+    /// The bounds may be non-empty if there is a `where` clause.
+    RequiredAssocTypeItem(Generics, Vec<GenericBound>),
+    /// An associated type in a trait impl or a provided one in a trait declaration.
+    AssocTypeItem(Box<TypeAlias>, Vec<GenericBound>),
     /// An item that has been stripped by a rustdoc pass
-    StrippedItem(Box<ItemEnum>),
-    KeywordItem(String),
+    StrippedItem(Box<ItemKind>),
+    /// This item represents a module with a `#[doc(keyword = "...")]` attribute which is used
+    /// to generate documentation for Rust keywords.
+    KeywordItem,
+    /// This item represents a module with a `#[doc(attribute = "...")]` attribute which is used
+    /// to generate documentation for Rust builtin attributes.
+    AttributeItem,
 }
 
-impl ItemEnum {
-    pub fn is_associated(&self) -> bool {
-        match *self {
-            ItemEnum::TypedefItem(_, _) | ItemEnum::AssocTypeItem(_, _) => true,
-            _ => false,
+impl ItemKind {
+    /// Some items contain others such as structs (for their fields) and Enums
+    /// (for their variants). This method returns those contained items.
+    pub(crate) fn inner_items(&self) -> impl Iterator<Item = &Item> {
+        match self {
+            StructItem(s) => s.fields.iter(),
+            UnionItem(u) => u.fields.iter(),
+            VariantItem(v) => match &v.kind {
+                VariantKind::CLike => [].iter(),
+                VariantKind::Tuple(t) => t.iter(),
+                VariantKind::Struct(s) => s.fields.iter(),
+            },
+            EnumItem(e) => e.variants.iter(),
+            TraitItem(t) => t.items.iter(),
+            ImplItem(i) => i.items.iter(),
+            ModuleItem(m) => m.items.iter(),
+            ExternCrateItem { .. }
+            | ImportItem(_)
+            | FunctionItem(_)
+            | TypeAliasItem(_)
+            | StaticItem(_)
+            | ConstantItem(_)
+            | TraitAliasItem(_)
+            | RequiredMethodItem(_)
+            | MethodItem(_, _)
+            | StructFieldItem(_)
+            | ForeignFunctionItem(_, _)
+            | ForeignStaticItem(_, _)
+            | ForeignTypeItem
+            | MacroItem(_)
+            | ProcMacroItem(_)
+            | PrimitiveItem(_)
+            | RequiredAssocConstItem(..)
+            | ProvidedAssocConstItem(..)
+            | ImplAssocConstItem(..)
+            | RequiredAssocTypeItem(..)
+            | AssocTypeItem(..)
+            | StrippedItem(_)
+            | KeywordItem
+            | AttributeItem => [].iter(),
         }
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct Module {
-    pub items: Vec<Item>,
-    pub is_crate: bool,
+pub(crate) struct Module {
+    pub(crate) items: Vec<Item>,
+    pub(crate) span: Span,
 }
 
-pub struct ListAttributesIter<'a> {
-    attrs: slice::Iter<'a, ast::Attribute>,
-    current_list: vec::IntoIter<ast::NestedMetaItem>,
+pub(crate) fn hir_attr_lists<'a, I: IntoIterator<Item = &'a hir::Attribute>>(
+    attrs: I,
     name: Symbol,
+) -> impl Iterator<Item = ast::MetaItemInner> + use<'a, I> {
+    attrs
+        .into_iter()
+        .filter(move |attr| attr.has_name(name))
+        .filter_map(ast::attr::AttributeExt::meta_item_list)
+        .flatten()
 }
 
-impl<'a> Iterator for ListAttributesIter<'a> {
-    type Item = ast::NestedMetaItem;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(nested) = self.current_list.next() {
-            return Some(nested);
-        }
-
-        for attr in &mut self.attrs {
-            if let Some(list) = attr.meta_item_list() {
-                if attr.check_name(self.name) {
-                    self.current_list = list.into_iter();
-                    if let Some(nested) = self.current_list.next() {
-                        return Some(nested);
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let lower = self.current_list.len();
-        (lower, None)
-    }
-}
-
-pub trait AttributesExt {
-    /// Finds an attribute as List and returns the list of attributes nested inside.
-    fn lists(&self, name: Symbol) -> ListAttributesIter<'_>;
-}
-
-impl AttributesExt for [ast::Attribute] {
-    fn lists(&self, name: Symbol) -> ListAttributesIter<'_> {
-        ListAttributesIter { attrs: self.iter(), current_list: Vec::new().into_iter(), name }
-    }
-}
-
-pub trait NestedAttributesExt {
-    /// Returns `true` if the attribute list contains a specific `Word`
-    fn has_word(self, word: Symbol) -> bool;
-}
-
-impl<I: IntoIterator<Item = ast::NestedMetaItem>> NestedAttributesExt for I {
-    fn has_word(self, word: Symbol) -> bool {
-        self.into_iter().any(|attr| attr.is_word() && attr.check_name(word))
-    }
-}
-
-/// A portion of documentation, extracted from a `#[doc]` attribute.
-///
-/// Each variant contains the line number within the complete doc-comment where the fragment
-/// starts, as well as the Span where the corresponding doc comment or attribute is located.
-///
-/// Included files are kept separate from inline doc comments so that proper line-number
-/// information can be given when a doctest fails. Sugared doc comments and "raw" doc comments are
-/// kept separate because of issue #42760.
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub enum DocFragment {
-    /// A doc fragment created from a `///` or `//!` doc comment.
-    SugaredDoc(usize, rustc_span::Span, String),
-    /// A doc fragment created from a "raw" `#[doc=""]` attribute.
-    RawDoc(usize, rustc_span::Span, String),
-    /// A doc fragment created from a `#[doc(include="filename")]` attribute. Contains both the
-    /// given filename and the file contents.
-    Include(usize, rustc_span::Span, String, String),
-}
-
-impl DocFragment {
-    pub fn as_str(&self) -> &str {
-        match *self {
-            DocFragment::SugaredDoc(_, _, ref s) => &s[..],
-            DocFragment::RawDoc(_, _, ref s) => &s[..],
-            DocFragment::Include(_, _, _, ref s) => &s[..],
-        }
-    }
-
-    pub fn span(&self) -> rustc_span::Span {
-        match *self {
-            DocFragment::SugaredDoc(_, span, _)
-            | DocFragment::RawDoc(_, span, _)
-            | DocFragment::Include(_, span, _, _) => span,
-        }
-    }
-}
-
-impl<'a> FromIterator<&'a DocFragment> for String {
-    fn from_iter<T>(iter: T) -> Self
+pub(crate) trait NestedAttributesExt {
+    /// Returns `true` if the attribute list contains a specific `word`
+    fn has_word(self, word: Symbol) -> bool
     where
-        T: IntoIterator<Item = &'a DocFragment>,
+        Self: Sized,
     {
-        iter.into_iter().fold(String::new(), |mut acc, frag| {
-            if !acc.is_empty() {
-                acc.push('\n');
-            }
-            match *frag {
-                DocFragment::SugaredDoc(_, _, ref docs)
-                | DocFragment::RawDoc(_, _, ref docs)
-                | DocFragment::Include(_, _, _, ref docs) => acc.push_str(docs),
-            }
+        <Self as NestedAttributesExt>::get_word_attr(self, word).is_some()
+    }
 
-            acc
-        })
+    /// Returns `Some(attr)` if the attribute list contains 'attr'
+    /// corresponding to a specific `word`
+    fn get_word_attr(self, word: Symbol) -> Option<ast::MetaItemInner>;
+}
+
+impl<I: Iterator<Item = ast::MetaItemInner>> NestedAttributesExt for I {
+    fn get_word_attr(mut self, word: Symbol) -> Option<ast::MetaItemInner> {
+        self.find(|attr| attr.is_word() && attr.has_name(word))
     }
 }
 
+/// A link that has not yet been rendered.
+///
+/// This link will be turned into a rendered link by [`Item::links`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ItemLink {
+    /// The original link written in the markdown
+    pub(crate) link: Box<str>,
+    /// The link text displayed in the HTML.
+    ///
+    /// This may not be the same as `link` if there was a disambiguator
+    /// in an intra-doc link (e.g. \[`fn@f`\])
+    pub(crate) link_text: Box<str>,
+    /// The `DefId` of the Item whose **HTML Page** contains the item being
+    /// linked to. This will be different to `item_id` on item's that don't
+    /// have their own page, such as struct fields and enum variants.
+    pub(crate) page_id: DefId,
+    /// The url fragment to append to the link
+    pub(crate) fragment: Option<UrlFragment>,
+}
+
+pub struct RenderedLink {
+    /// The text the link was original written as.
+    ///
+    /// This could potentially include disambiguators and backticks.
+    pub(crate) original_text: Box<str>,
+    /// The text to display in the HTML
+    pub(crate) new_text: Box<str>,
+    /// The URL to put in the `href`
+    pub(crate) href: String,
+    /// The tooltip.
+    pub(crate) tooltip: String,
+}
+
+/// The attributes on an [`Item`], including attributes like `#[derive(...)]` and `#[inline]`,
+/// as well as doc comments.
 #[derive(Clone, Debug, Default)]
-pub struct Attributes {
-    pub doc_strings: Vec<DocFragment>,
-    pub other_attrs: Vec<ast::Attribute>,
-    pub cfg: Option<Arc<Cfg>>,
-    pub span: Option<rustc_span::Span>,
-    /// map from Rust paths to resolved defs and potential URL fragments
-    pub links: Vec<(String, Option<DefId>, Option<String>)>,
-    pub inner_docs: bool,
+pub(crate) struct Attributes {
+    pub(crate) doc_strings: Vec<DocFragment>,
+    pub(crate) other_attrs: ThinVec<hir::Attribute>,
 }
 
 impl Attributes {
-    /// Extracts the content from an attribute `#[doc(cfg(content))]`.
-    pub fn extract_cfg(mi: &ast::MetaItem) -> Option<&ast::MetaItem> {
-        use rustc_ast::ast::NestedMetaItem::MetaItem;
-
-        if let ast::MetaItemKind::List(ref nmis) = mi.kind {
-            if nmis.len() == 1 {
-                if let MetaItem(ref cfg_mi) = nmis[0] {
-                    if cfg_mi.check_name(sym::cfg) {
-                        if let ast::MetaItemKind::List(ref cfg_nmis) = cfg_mi.kind {
-                            if cfg_nmis.len() == 1 {
-                                if let MetaItem(ref content_mi) = cfg_nmis[0] {
-                                    return Some(content_mi);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        None
+    pub(crate) fn lists(&self, name: Symbol) -> impl Iterator<Item = ast::MetaItemInner> {
+        hir_attr_lists(&self.other_attrs[..], name)
     }
 
-    /// Reads a `MetaItem` from within an attribute, looks for whether it is a
-    /// `#[doc(include="file")]`, and returns the filename and contents of the file as loaded from
-    /// its expansion.
-    pub fn extract_include(mi: &ast::MetaItem) -> Option<(String, String)> {
-        mi.meta_item_list().and_then(|list| {
-            for meta in list {
-                if meta.check_name(sym::include) {
-                    // the actual compiled `#[doc(include="filename")]` gets expanded to
-                    // `#[doc(include(file="filename", contents="file contents")]` so we need to
-                    // look for that instead
-                    return meta.meta_item_list().and_then(|list| {
-                        let mut filename: Option<String> = None;
-                        let mut contents: Option<String> = None;
-
-                        for it in list {
-                            if it.check_name(sym::file) {
-                                if let Some(name) = it.value_str() {
-                                    filename = Some(name.to_string());
-                                }
-                            } else if it.check_name(sym::contents) {
-                                if let Some(docs) = it.value_str() {
-                                    contents = Some(docs.to_string());
-                                }
-                            }
-                        }
-
-                        if let (Some(filename), Some(contents)) = (filename, contents) {
-                            Some((filename, contents))
-                        } else {
-                            None
-                        }
-                    });
-                }
-            }
-
-            None
-        })
-    }
-
-    pub fn has_doc_flag(&self, flag: Symbol) -> bool {
+    pub(crate) fn has_doc_flag(&self, flag: Symbol) -> bool {
         for attr in &self.other_attrs {
-            if !attr.check_name(sym::doc) {
+            if !attr.has_name(sym::doc) {
                 continue;
             }
 
-            if let Some(items) = attr.meta_item_list() {
-                if items.iter().filter_map(|i| i.meta_item()).any(|it| it.check_name(flag)) {
-                    return true;
-                }
+            if let Some(items) = attr.meta_item_list()
+                && items.iter().filter_map(|i| i.meta_item()).any(|it| it.has_name(flag))
+            {
+                return true;
             }
         }
 
         false
     }
 
-    pub fn from_ast(diagnostic: &::rustc_errors::Handler, attrs: &[ast::Attribute]) -> Attributes {
-        let mut doc_strings = vec![];
-        let mut sp = None;
-        let mut cfg = Cfg::True;
-        let mut doc_line = 0;
+    pub(crate) fn is_doc_hidden(&self) -> bool {
+        self.has_doc_flag(sym::hidden)
+    }
 
-        let other_attrs = attrs
-            .iter()
-            .filter_map(|attr| {
-                if let Some(value) = attr.doc_str() {
-                    let (value, mk_fragment): (_, fn(_, _, _) -> _) = if attr.is_doc_comment() {
-                        (strip_doc_comment_decoration(&value.as_str()), DocFragment::SugaredDoc)
-                    } else {
-                        (value.to_string(), DocFragment::RawDoc)
-                    };
+    pub(crate) fn from_hir(attrs: &[hir::Attribute]) -> Attributes {
+        Attributes::from_hir_iter(attrs.iter().map(|attr| (attr, None)), false)
+    }
 
-                    let line = doc_line;
-                    doc_line += value.lines().count();
-                    doc_strings.push(mk_fragment(line, attr.span, value));
+    pub(crate) fn from_hir_with_additional(
+        attrs: &[hir::Attribute],
+        (additional_attrs, def_id): (&[hir::Attribute], DefId),
+    ) -> Attributes {
+        // Additional documentation should be shown before the original documentation.
+        let attrs1 = additional_attrs.iter().map(|attr| (attr, Some(def_id)));
+        let attrs2 = attrs.iter().map(|attr| (attr, None));
+        Attributes::from_hir_iter(attrs1.chain(attrs2), false)
+    }
 
-                    if sp.is_none() {
-                        sp = Some(attr.span);
-                    }
-                    None
-                } else {
-                    if attr.check_name(sym::doc) {
-                        if let Some(mi) = attr.meta() {
-                            if let Some(cfg_mi) = Attributes::extract_cfg(&mi) {
-                                // Extracted #[doc(cfg(...))]
-                                match Cfg::parse(cfg_mi) {
-                                    Ok(new_cfg) => cfg &= new_cfg,
-                                    Err(e) => diagnostic.span_err(e.span, e.msg),
-                                }
-                            } else if let Some((filename, contents)) =
-                                Attributes::extract_include(&mi)
-                            {
-                                let line = doc_line;
-                                doc_line += contents.lines().count();
-                                doc_strings.push(DocFragment::Include(
-                                    line, attr.span, filename, contents,
-                                ));
-                            }
-                        }
-                    }
-                    Some(attr.clone())
-                }
-            })
-            .collect();
+    pub(crate) fn from_hir_iter<'a>(
+        attrs: impl Iterator<Item = (&'a hir::Attribute, Option<DefId>)>,
+        doc_only: bool,
+    ) -> Attributes {
+        let (doc_strings, other_attrs) = attrs_to_doc_fragments(attrs, doc_only);
+        Attributes { doc_strings, other_attrs }
+    }
 
-        // treat #[target_feature(enable = "feat")] attributes as if they were
-        // #[doc(cfg(target_feature = "feat"))] attributes as well
-        for attr in attrs.lists(sym::target_feature) {
-            if attr.check_name(sym::enable) {
-                if let Some(feat) = attr.value_str() {
-                    let meta = attr::mk_name_value_item_str(
-                        Ident::with_dummy_span(sym::target_feature),
-                        feat,
-                        DUMMY_SP,
-                    );
-                    if let Ok(feat_cfg) = Cfg::parse(&meta) {
-                        cfg &= feat_cfg;
+    /// Combine all doc strings into a single value handling indentation and newlines as needed.
+    pub(crate) fn doc_value(&self) -> String {
+        self.opt_doc_value().unwrap_or_default()
+    }
+
+    /// Combine all doc strings into a single value handling indentation and newlines as needed.
+    /// Returns `None` is there's no documentation at all, and `Some("")` if there is some
+    /// documentation but it is empty (e.g. `#[doc = ""]`).
+    pub(crate) fn opt_doc_value(&self) -> Option<String> {
+        (!self.doc_strings.is_empty()).then(|| {
+            let mut res = String::new();
+            for frag in &self.doc_strings {
+                add_doc_fragment(&mut res, frag);
+            }
+            res.pop();
+            res
+        })
+    }
+
+    pub(crate) fn get_doc_aliases(&self) -> Box<[Symbol]> {
+        let mut aliases = FxIndexSet::default();
+
+        for attr in
+            hir_attr_lists(&self.other_attrs[..], sym::doc).filter(|a| a.has_name(sym::alias))
+        {
+            if let Some(values) = attr.meta_item_list() {
+                for l in values {
+                    if let Some(lit) = l.lit()
+                        && let ast::LitKind::Str(s, _) = lit.kind
+                    {
+                        aliases.insert(s);
                     }
                 }
+            } else if let Some(value) = attr.value_str() {
+                aliases.insert(value);
             }
         }
-
-        let inner_docs = attrs
-            .iter()
-            .find(|a| a.doc_str().is_some())
-            .map_or(true, |a| a.style == AttrStyle::Inner);
-
-        Attributes {
-            doc_strings,
-            other_attrs,
-            cfg: if cfg == Cfg::True { None } else { Some(Arc::new(cfg)) },
-            span: sp,
-            links: vec![],
-            inner_docs,
-        }
-    }
-
-    /// Finds the `doc` attribute as a NameValue and returns the corresponding
-    /// value found.
-    pub fn doc_value(&self) -> Option<&str> {
-        self.doc_strings.first().map(|s| s.as_str())
-    }
-
-    /// Finds all `doc` attributes as NameValues and returns their corresponding values, joined
-    /// with newlines.
-    pub fn collapsed_doc_value(&self) -> Option<String> {
-        if !self.doc_strings.is_empty() { Some(self.doc_strings.iter().collect()) } else { None }
-    }
-
-    /// Gets links as a vector
-    ///
-    /// Cache must be populated before call
-    pub fn links(&self, krate: &CrateNum) -> Vec<(String, String)> {
-        use crate::html::format::href;
-
-        self.links
-            .iter()
-            .filter_map(|&(ref s, did, ref fragment)| {
-                match did {
-                    Some(did) => {
-                        if let Some((mut href, ..)) = href(did) {
-                            if let Some(ref fragment) = *fragment {
-                                href.push_str("#");
-                                href.push_str(fragment);
-                            }
-                            Some((s.clone(), href))
-                        } else {
-                            None
-                        }
-                    }
-                    None => {
-                        if let Some(ref fragment) = *fragment {
-                            let cache = cache();
-                            let url = match cache.extern_locations.get(krate) {
-                                Some(&(_, ref src, ExternalLocation::Local)) => {
-                                    src.to_str().expect("invalid file path")
-                                }
-                                Some(&(_, _, ExternalLocation::Remote(ref s))) => s,
-                                Some(&(_, _, ExternalLocation::Unknown)) | None => {
-                                    "https://doc.rust-lang.org/nightly"
-                                }
-                            };
-                            // This is a primitive so the url is done "by hand".
-                            let tail = fragment.find('#').unwrap_or_else(|| fragment.len());
-                            Some((
-                                s.clone(),
-                                format!(
-                                    "{}{}std/primitive.{}.html{}",
-                                    url,
-                                    if !url.ends_with('/') { "/" } else { "" },
-                                    &fragment[..tail],
-                                    &fragment[tail..]
-                                ),
-                            ))
-                        } else {
-                            panic!("This isn't a primitive?!");
-                        }
-                    }
-                }
-            })
-            .collect()
-    }
-
-    pub fn get_doc_aliases(&self) -> FxHashSet<String> {
-        self.other_attrs
-            .lists(sym::doc)
-            .filter(|a| a.check_name(sym::alias))
-            .filter_map(|a| a.value_str().map(|s| s.to_string().replace("\"", "")))
-            .filter(|v| !v.is_empty())
-            .collect::<FxHashSet<_>>()
-    }
-}
-
-impl PartialEq for Attributes {
-    fn eq(&self, rhs: &Self) -> bool {
-        self.doc_strings == rhs.doc_strings
-            && self.cfg == rhs.cfg
-            && self.span == rhs.span
-            && self.links == rhs.links
-            && self
-                .other_attrs
-                .iter()
-                .map(|attr| attr.id)
-                .eq(rhs.other_attrs.iter().map(|attr| attr.id))
-    }
-}
-
-impl Eq for Attributes {}
-
-impl Hash for Attributes {
-    fn hash<H: Hasher>(&self, hasher: &mut H) {
-        self.doc_strings.hash(hasher);
-        self.cfg.hash(hasher);
-        self.span.hash(hasher);
-        self.links.hash(hasher);
-        for attr in &self.other_attrs {
-            attr.id.hash(hasher);
-        }
-    }
-}
-
-impl AttributesExt for Attributes {
-    fn lists(&self, name: Symbol) -> ListAttributesIter<'_> {
-        self.other_attrs.lists(name)
+        aliases.into_iter().collect::<Vec<_>>().into()
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub enum GenericBound {
-    TraitBound(PolyTrait, hir::TraitBoundModifier),
+pub(crate) enum GenericBound {
+    TraitBound(PolyTrait, hir::TraitBoundModifiers),
     Outlives(Lifetime),
+    /// `use<'a, T>` precise-capturing bound syntax
+    Use(Vec<PreciseCapturingArg>),
 }
 
 impl GenericBound {
-    pub fn maybe_sized(cx: &DocContext<'_>) -> GenericBound {
-        let did = cx.tcx.require_lang_item(lang_items::SizedTraitLangItem, None);
-        let empty = cx.tcx.intern_substs(&[]);
-        let path = external_path(cx, cx.tcx.item_name(did), Some(did), false, vec![], empty);
-        inline::record_extern_fqn(cx, did, TypeKind::Trait);
-        GenericBound::TraitBound(
-            PolyTrait {
-                trait_: ResolvedPath { path, param_names: None, did, is_generic: false },
-                generic_params: Vec::new(),
+    pub(crate) fn sized(cx: &mut DocContext<'_>) -> GenericBound {
+        Self::sized_with(cx, hir::TraitBoundModifiers::NONE)
+    }
+
+    pub(crate) fn maybe_sized(cx: &mut DocContext<'_>) -> GenericBound {
+        Self::sized_with(
+            cx,
+            hir::TraitBoundModifiers {
+                polarity: hir::BoundPolarity::Maybe(DUMMY_SP),
+                constness: hir::BoundConstness::Never,
             },
-            hir::TraitBoundModifier::Maybe,
         )
     }
 
-    pub fn is_sized_bound(&self, cx: &DocContext<'_>) -> bool {
-        use rustc_hir::TraitBoundModifier as TBM;
-        if let GenericBound::TraitBound(PolyTrait { ref trait_, .. }, TBM::None) = *self {
-            if trait_.def_id() == cx.tcx.lang_items().sized_trait() {
-                return true;
-            }
+    fn sized_with(cx: &mut DocContext<'_>, modifiers: hir::TraitBoundModifiers) -> GenericBound {
+        let did = cx.tcx.require_lang_item(LangItem::Sized, DUMMY_SP);
+        let empty = ty::Binder::dummy(ty::GenericArgs::empty());
+        let path = clean_middle_path(cx, did, false, ThinVec::new(), empty);
+        inline::record_extern_fqn(cx, did, ItemType::Trait);
+        GenericBound::TraitBound(PolyTrait { trait_: path, generic_params: Vec::new() }, modifiers)
+    }
+
+    pub(crate) fn is_trait_bound(&self) -> bool {
+        matches!(self, Self::TraitBound(..))
+    }
+
+    pub(crate) fn is_sized_bound(&self, cx: &DocContext<'_>) -> bool {
+        self.is_bounded_by_lang_item(cx, LangItem::Sized)
+    }
+
+    pub(crate) fn is_meta_sized_bound(&self, cx: &DocContext<'_>) -> bool {
+        self.is_bounded_by_lang_item(cx, LangItem::MetaSized)
+    }
+
+    fn is_bounded_by_lang_item(&self, cx: &DocContext<'_>, lang_item: LangItem) -> bool {
+        if let GenericBound::TraitBound(
+            PolyTrait { ref trait_, .. },
+            rustc_hir::TraitBoundModifiers::NONE,
+        ) = *self
+            && cx.tcx.is_lang_item(trait_.def_id(), lang_item)
+        {
+            return true;
         }
         false
     }
 
-    pub fn get_poly_trait(&self) -> Option<PolyTrait> {
-        if let GenericBound::TraitBound(ref p, _) = *self {
-            return Some(p.clone());
-        }
-        None
-    }
-
-    pub fn get_trait_type(&self) -> Option<Type> {
+    pub(crate) fn get_trait_path(&self) -> Option<Path> {
         if let GenericBound::TraitBound(PolyTrait { ref trait_, .. }, _) = *self {
             Some(trait_.clone())
         } else {
@@ -735,96 +1134,89 @@ impl GenericBound {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct Lifetime(pub String);
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub(crate) struct Lifetime(pub Symbol);
 
 impl Lifetime {
-    pub fn get_ref<'a>(&'a self) -> &'a str {
-        let Lifetime(ref s) = *self;
-        let s: &'a str = s;
-        s
+    pub(crate) fn statik() -> Lifetime {
+        Lifetime(kw::StaticLifetime)
     }
 
-    pub fn statik() -> Lifetime {
-        Lifetime("'static".to_string())
+    pub(crate) fn elided() -> Lifetime {
+        Lifetime(kw::UnderscoreLifetime)
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum WherePredicate {
-    BoundPredicate { ty: Type, bounds: Vec<GenericBound> },
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub(crate) enum PreciseCapturingArg {
+    Lifetime(Lifetime),
+    Param(Symbol),
+}
+
+impl PreciseCapturingArg {
+    pub(crate) fn name(self) -> Symbol {
+        match self {
+            PreciseCapturingArg::Lifetime(lt) => lt.0,
+            PreciseCapturingArg::Param(param) => param,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum WherePredicate {
+    BoundPredicate { ty: Type, bounds: Vec<GenericBound>, bound_params: Vec<GenericParamDef> },
     RegionPredicate { lifetime: Lifetime, bounds: Vec<GenericBound> },
-    EqPredicate { lhs: Type, rhs: Type },
+    EqPredicate { lhs: QPathData, rhs: Term },
 }
 
 impl WherePredicate {
-    pub fn get_bounds(&self) -> Option<&[GenericBound]> {
-        match *self {
-            WherePredicate::BoundPredicate { ref bounds, .. } => Some(bounds),
-            WherePredicate::RegionPredicate { ref bounds, .. } => Some(bounds),
+    pub(crate) fn get_bounds(&self) -> Option<&[GenericBound]> {
+        match self {
+            WherePredicate::BoundPredicate { bounds, .. } => Some(bounds),
+            WherePredicate::RegionPredicate { bounds, .. } => Some(bounds),
             _ => None,
         }
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub enum GenericParamDefKind {
-    Lifetime,
-    Type {
-        did: DefId,
-        bounds: Vec<GenericBound>,
-        default: Option<Type>,
-        synthetic: Option<hir::SyntheticTyParamKind>,
-    },
-    Const {
-        did: DefId,
-        ty: Type,
-    },
+pub(crate) enum GenericParamDefKind {
+    Lifetime { outlives: ThinVec<Lifetime> },
+    Type { bounds: ThinVec<GenericBound>, default: Option<Box<Type>>, synthetic: bool },
+    // Option<Box<String>> makes this type smaller than `Option<String>` would.
+    Const { ty: Box<Type>, default: Option<Box<String>> },
 }
 
 impl GenericParamDefKind {
-    pub fn is_type(&self) -> bool {
-        match *self {
-            GenericParamDefKind::Type { .. } => true,
-            _ => false,
-        }
-    }
-
-    // FIXME(eddyb) this either returns the default of a type parameter, or the
-    // type of a `const` parameter. It seems that the intention is to *visit*
-    // any embedded types, but `get_type` seems to be the wrong name for that.
-    pub fn get_type(&self) -> Option<Type> {
-        match self {
-            GenericParamDefKind::Type { default, .. } => default.clone(),
-            GenericParamDefKind::Const { ty, .. } => Some(ty.clone()),
-            GenericParamDefKind::Lifetime => None,
-        }
+    pub(crate) fn is_type(&self) -> bool {
+        matches!(self, GenericParamDefKind::Type { .. })
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct GenericParamDef {
-    pub name: String,
-    pub kind: GenericParamDefKind,
+pub(crate) struct GenericParamDef {
+    pub(crate) name: Symbol,
+    pub(crate) def_id: DefId,
+    pub(crate) kind: GenericParamDefKind,
 }
 
 impl GenericParamDef {
-    pub fn is_synthetic_type_param(&self) -> bool {
+    pub(crate) fn lifetime(def_id: DefId, name: Symbol) -> Self {
+        Self { name, def_id, kind: GenericParamDefKind::Lifetime { outlives: ThinVec::new() } }
+    }
+
+    pub(crate) fn is_synthetic_param(&self) -> bool {
         match self.kind {
-            GenericParamDefKind::Lifetime | GenericParamDefKind::Const { .. } => false,
-            GenericParamDefKind::Type { ref synthetic, .. } => synthetic.is_some(),
+            GenericParamDefKind::Lifetime { .. } | GenericParamDefKind::Const { .. } => false,
+            GenericParamDefKind::Type { synthetic, .. } => synthetic,
         }
     }
 
-    pub fn is_type(&self) -> bool {
+    pub(crate) fn is_type(&self) -> bool {
         self.kind.is_type()
     }
 
-    pub fn get_type(&self) -> Option<Type> {
-        self.kind.get_type()
-    }
-
-    pub fn get_bounds(&self) -> Option<&[GenericBound]> {
+    pub(crate) fn get_bounds(&self) -> Option<&[GenericBound]> {
         match self.kind {
             GenericParamDefKind::Type { ref bounds, .. } => Some(bounds),
             _ => None,
@@ -833,254 +1225,235 @@ impl GenericParamDef {
 }
 
 // maybe use a Generic enum and use Vec<Generic>?
-#[derive(Clone, Debug, Default)]
-pub struct Generics {
-    pub params: Vec<GenericParamDef>,
-    pub where_predicates: Vec<WherePredicate>,
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
+pub(crate) struct Generics {
+    pub(crate) params: ThinVec<GenericParamDef>,
+    pub(crate) where_predicates: ThinVec<WherePredicate>,
+}
+
+impl Generics {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.params.is_empty() && self.where_predicates.is_empty()
+    }
 }
 
 #[derive(Clone, Debug)]
-pub struct Method {
-    pub generics: Generics,
-    pub decl: FnDecl,
-    pub header: hir::FnHeader,
-    pub defaultness: Option<hir::Defaultness>,
-    pub all_types: Vec<(Type, TypeKind)>,
-    pub ret_types: Vec<(Type, TypeKind)>,
-}
-
-#[derive(Clone, Debug)]
-pub struct TyMethod {
-    pub header: hir::FnHeader,
-    pub decl: FnDecl,
-    pub generics: Generics,
-    pub all_types: Vec<(Type, TypeKind)>,
-    pub ret_types: Vec<(Type, TypeKind)>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Function {
-    pub decl: FnDecl,
-    pub generics: Generics,
-    pub header: hir::FnHeader,
-    pub all_types: Vec<(Type, TypeKind)>,
-    pub ret_types: Vec<(Type, TypeKind)>,
+pub(crate) struct Function {
+    pub(crate) decl: FnDecl,
+    pub(crate) generics: Generics,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct FnDecl {
-    pub inputs: Arguments,
-    pub output: FnRetTy,
-    pub c_variadic: bool,
-    pub attrs: Attributes,
+pub(crate) struct FnDecl {
+    pub(crate) inputs: Vec<Parameter>,
+    pub(crate) output: Type,
+    pub(crate) c_variadic: bool,
 }
 
 impl FnDecl {
-    pub fn self_type(&self) -> Option<SelfTy> {
-        self.inputs.values.get(0).and_then(|v| v.to_self())
-    }
-
-    /// Returns the sugared return type for an async function.
-    ///
-    /// For example, if the return type is `impl std::future::Future<Output = i32>`, this function
-    /// will return `i32`.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if the return type does not match the expected sugaring for async
-    /// functions.
-    pub fn sugared_async_return_type(&self) -> FnRetTy {
-        match &self.output {
-            FnRetTy::Return(Type::ImplTrait(bounds)) => match &bounds[0] {
-                GenericBound::TraitBound(PolyTrait { trait_, .. }, ..) => {
-                    let bindings = trait_.bindings().unwrap();
-                    FnRetTy::Return(bindings[0].ty().clone())
-                }
-                _ => panic!("unexpected desugaring of async function"),
-            },
-            _ => panic!("unexpected desugaring of async function"),
-        }
+    pub(crate) fn receiver_type(&self) -> Option<&Type> {
+        self.inputs.first().and_then(|v| v.to_receiver())
     }
 }
 
+/// A function parameter.
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct Arguments {
-    pub values: Vec<Argument>,
+pub(crate) struct Parameter {
+    pub(crate) name: Option<Symbol>,
+    pub(crate) type_: Type,
+    /// This field is used to represent "const" arguments from the `rustc_legacy_const_generics`
+    /// feature. More information in <https://github.com/rust-lang/rust/issues/83167>.
+    pub(crate) is_const: bool,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct Argument {
-    pub type_: Type,
-    pub name: String,
-}
-
-#[derive(Clone, PartialEq, Debug)]
-pub enum SelfTy {
-    SelfValue,
-    SelfBorrowed(Option<Lifetime>, Mutability),
-    SelfExplicit(Type),
-}
-
-impl Argument {
-    pub fn to_self(&self) -> Option<SelfTy> {
-        if self.name != "self" {
-            return None;
-        }
-        if self.type_.is_self_type() {
-            return Some(SelfValue);
-        }
-        match self.type_ {
-            BorrowedRef { ref lifetime, mutability, ref type_ } if type_.is_self_type() => {
-                Some(SelfBorrowed(lifetime.clone(), mutability))
-            }
-            _ => Some(SelfExplicit(self.type_.clone())),
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub enum FnRetTy {
-    Return(Type),
-    DefaultReturn,
-}
-
-impl GetDefId for FnRetTy {
-    fn def_id(&self) -> Option<DefId> {
-        match *self {
-            Return(ref ty) => ty.def_id(),
-            DefaultReturn => None,
-        }
+impl Parameter {
+    pub(crate) fn to_receiver(&self) -> Option<&Type> {
+        if self.name == Some(kw::SelfLower) { Some(&self.type_) } else { None }
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct Trait {
-    pub auto: bool,
-    pub unsafety: hir::Unsafety,
-    pub items: Vec<Item>,
-    pub generics: Generics,
-    pub bounds: Vec<GenericBound>,
-    pub is_auto: bool,
+pub(crate) struct Trait {
+    pub(crate) def_id: DefId,
+    pub(crate) items: Vec<Item>,
+    pub(crate) generics: Generics,
+    pub(crate) bounds: Vec<GenericBound>,
+}
+
+impl Trait {
+    pub(crate) fn is_auto(&self, tcx: TyCtxt<'_>) -> bool {
+        tcx.trait_is_auto(self.def_id)
+    }
+    pub(crate) fn is_notable_trait(&self, tcx: TyCtxt<'_>) -> bool {
+        tcx.is_doc_notable_trait(self.def_id)
+    }
+    pub(crate) fn safety(&self, tcx: TyCtxt<'_>) -> hir::Safety {
+        tcx.trait_def(self.def_id).safety
+    }
+    pub(crate) fn is_dyn_compatible(&self, tcx: TyCtxt<'_>) -> bool {
+        tcx.is_dyn_compatible(self.def_id)
+    }
 }
 
 #[derive(Clone, Debug)]
-pub struct TraitAlias {
-    pub generics: Generics,
-    pub bounds: Vec<GenericBound>,
+pub(crate) struct TraitAlias {
+    pub(crate) generics: Generics,
+    pub(crate) bounds: Vec<GenericBound>,
 }
 
 /// A trait reference, which may have higher ranked lifetimes.
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct PolyTrait {
-    pub trait_: Type,
-    pub generic_params: Vec<GenericParamDef>,
+pub(crate) struct PolyTrait {
+    pub(crate) trait_: Path,
+    pub(crate) generic_params: Vec<GenericParamDef>,
 }
 
-/// A representation of a type suitable for hyperlinking purposes. Ideally, one can get the original
-/// type out of the AST/`TyCtxt` given one of these, if more information is needed. Most
-/// importantly, it does not preserve mutability or boxes.
+/// Rustdoc's representation of types, mostly based on the [`hir::Ty`].
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub enum Type {
-    /// Structs/enums/traits (most that would be an `hir::TyKind::Path`).
-    ResolvedPath {
+pub(crate) enum Type {
+    /// A named type, which could be a trait.
+    ///
+    /// This is mostly Rustdoc's version of [`hir::Path`].
+    /// It has to be different because Rustdoc's [`PathSegment`] can contain cleaned generics.
+    Path {
         path: Path,
-        param_names: Option<Vec<GenericBound>>,
-        did: DefId,
-        /// `true` if is a `T::Name` path for associated types.
-        is_generic: bool,
     },
-    /// For parameterized types, so the consumer of the JSON don't go
-    /// looking for types which don't exist anywhere.
-    Generic(String),
-    /// Primitives are the fixed-size numeric types (plus int/usize/float), char,
-    /// arrays, slices, and tuples.
+    /// A `dyn Trait` object: `dyn for<'a> Trait<'a> + Send + 'static`
+    DynTrait(Vec<PolyTrait>, Option<Lifetime>),
+    /// A type parameter.
+    Generic(Symbol),
+    /// The `Self` type.
+    SelfTy,
+    /// A primitive (aka, builtin) type.
     Primitive(PrimitiveType),
-    /// `extern "ABI" fn`
+    /// A function pointer: `extern "ABI" fn(...) -> ...`
     BareFunction(Box<BareFunctionDecl>),
+    /// A tuple type: `(i32, &str)`.
     Tuple(Vec<Type>),
+    /// A slice type (does *not* include the `&`): `[i32]`
     Slice(Box<Type>),
-    Array(Box<Type>, String),
-    Never,
+    /// An array type.
+    ///
+    /// The `String` field is a stringified version of the array's length parameter.
+    Array(Box<Type>, Box<str>),
+    Pat(Box<Type>, Box<str>),
+    /// A raw pointer type: `*const i32`, `*mut i32`
     RawPointer(Mutability, Box<Type>),
+    /// A reference type: `&i32`, `&'a mut Foo`
     BorrowedRef {
         lifetime: Option<Lifetime>,
         mutability: Mutability,
         type_: Box<Type>,
     },
 
-    // `<Type as Trait>::Name`
-    QPath {
-        name: String,
-        self_type: Box<Type>,
-        trait_: Box<Type>,
-    },
+    /// A qualified path to an associated item: `<Type as Trait>::Name`
+    QPath(Box<QPathData>),
 
-    // `_`
+    /// A type that is inferred: `_`
     Infer,
 
-    // `impl TraitA + TraitB + ...`
+    /// An `impl Trait`: `impl TraitA + TraitB + ...`
     ImplTrait(Vec<GenericBound>),
-}
 
-#[derive(Clone, PartialEq, Eq, Hash, Copy, Debug)]
-pub enum PrimitiveType {
-    Isize,
-    I8,
-    I16,
-    I32,
-    I64,
-    I128,
-    Usize,
-    U8,
-    U16,
-    U32,
-    U64,
-    U128,
-    F32,
-    F64,
-    Char,
-    Bool,
-    Str,
-    Slice,
-    Array,
-    Tuple,
-    Unit,
-    RawPointer,
-    Reference,
-    Fn,
-    Never,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Copy, Debug)]
-pub enum TypeKind {
-    Enum,
-    Function,
-    Module,
-    Const,
-    Static,
-    Struct,
-    Union,
-    Trait,
-    Typedef,
-    Foreign,
-    Macro,
-    Attr,
-    Derive,
-    TraitAlias,
-}
-
-pub trait GetDefId {
-    fn def_id(&self) -> Option<DefId>;
-}
-
-impl<T: GetDefId> GetDefId for Option<T> {
-    fn def_id(&self) -> Option<DefId> {
-        self.as_ref().and_then(|d| d.def_id())
-    }
+    UnsafeBinder(Box<UnsafeBinderTy>),
 }
 
 impl Type {
-    pub fn primitive_type(&self) -> Option<PrimitiveType> {
+    /// When comparing types for equality, it can help to ignore `&` wrapping.
+    pub(crate) fn without_borrowed_ref(&self) -> &Type {
+        let mut result = self;
+        while let Type::BorrowedRef { type_, .. } = result {
+            result = type_;
+        }
+        result
+    }
+
+    pub(crate) fn is_borrowed_ref(&self) -> bool {
+        matches!(self, Type::BorrowedRef { .. })
+    }
+
+    fn is_type_alias(&self) -> bool {
+        matches!(self, Type::Path { path: Path { res: Res::Def(DefKind::TyAlias, _), .. } })
+    }
+
+    /// Check if this type is a subtype of another type for documentation purposes.
+    ///
+    /// This is different from `Eq`, because it knows that things like
+    /// `Infer` and generics have special subtyping rules.
+    ///
+    /// This relation is not commutative when generics are involved:
+    ///
+    /// ```ignore(private)
+    /// # // see types/tests.rs:is_same_generic for the real test
+    /// use rustdoc::format::cache::Cache;
+    /// use rustdoc::clean::types::{Type, PrimitiveType};
+    /// let cache = Cache::new(false);
+    /// let generic = Type::Generic(rustc_span::symbol::sym::Any);
+    /// let unit = Type::Primitive(PrimitiveType::Unit);
+    /// assert!(!generic.is_doc_subtype_of(&unit, &cache));
+    /// assert!(unit.is_doc_subtype_of(&generic, &cache));
+    /// ```
+    ///
+    /// An owned type is also the same as its borrowed variants (this is commutative),
+    /// but `&T` is not the same as `&mut T`.
+    pub(crate) fn is_doc_subtype_of(&self, other: &Self, cache: &Cache) -> bool {
+        // Strip the references so that it can compare the actual types, unless both are references.
+        // If both are references, leave them alone and compare the mutabilities later.
+        let (self_cleared, other_cleared) = if !self.is_borrowed_ref() || !other.is_borrowed_ref() {
+            (self.without_borrowed_ref(), other.without_borrowed_ref())
+        } else {
+            (self, other)
+        };
+
+        // FIXME: `Cache` does not have the data required to unwrap type aliases,
+        // so we just assume they are equal.
+        // This is only remotely acceptable because we were previously
+        // assuming all types were equal when used
+        // as a generic parameter of a type in `Deref::Target`.
+        if self_cleared.is_type_alias() || other_cleared.is_type_alias() {
+            return true;
+        }
+
+        match (self_cleared, other_cleared) {
+            // Recursive cases.
+            (Type::Tuple(a), Type::Tuple(b)) => {
+                a.iter().eq_by(b, |a, b| a.is_doc_subtype_of(b, cache))
+            }
+            (Type::Slice(a), Type::Slice(b)) => a.is_doc_subtype_of(b, cache),
+            (Type::Array(a, al), Type::Array(b, bl)) => al == bl && a.is_doc_subtype_of(b, cache),
+            (Type::RawPointer(mutability, type_), Type::RawPointer(b_mutability, b_type_)) => {
+                mutability == b_mutability && type_.is_doc_subtype_of(b_type_, cache)
+            }
+            (
+                Type::BorrowedRef { mutability, type_, .. },
+                Type::BorrowedRef { mutability: b_mutability, type_: b_type_, .. },
+            ) => mutability == b_mutability && type_.is_doc_subtype_of(b_type_, cache),
+            // Placeholders are equal to all other types.
+            (Type::Infer, _) | (_, Type::Infer) => true,
+            // Generics match everything on the right, but not on the left.
+            // If both sides are generic, this returns true.
+            (_, Type::Generic(_)) => true,
+            (Type::Generic(_), _) => false,
+            // `Self` only matches itself.
+            (Type::SelfTy, Type::SelfTy) => true,
+            // Paths account for both the path itself and its generics.
+            (Type::Path { path: a }, Type::Path { path: b }) => {
+                a.def_id() == b.def_id()
+                    && a.generics()
+                        .zip(b.generics())
+                        .map(|(ag, bg)| ag.zip(bg).all(|(at, bt)| at.is_doc_subtype_of(bt, cache)))
+                        .unwrap_or(true)
+            }
+            // Other cases, such as primitives, just use recursion.
+            (a, b) => a
+                .def_id(cache)
+                .and_then(|a| Some((a, b.def_id(cache)?)))
+                .map(|(a, b)| a == b)
+                .unwrap_or(false),
+        }
+    }
+
+    pub(crate) fn primitive_type(&self) -> Option<PrimitiveType> {
         match *self {
             Primitive(p) | BorrowedRef { type_: box Primitive(p), .. } => Some(p),
             Slice(..) | BorrowedRef { type_: box Slice(..), .. } => Some(PrimitiveType::Slice),
@@ -1093,206 +1466,373 @@ impl Type {
                 }
             }
             RawPointer(..) => Some(PrimitiveType::RawPointer),
-            BorrowedRef { type_: box Generic(..), .. } => Some(PrimitiveType::Reference),
             BareFunction(..) => Some(PrimitiveType::Fn),
-            Never => Some(PrimitiveType::Never),
             _ => None,
         }
     }
 
-    pub fn is_generic(&self) -> bool {
-        match *self {
-            ResolvedPath { is_generic, .. } => is_generic,
+    /// Returns the sugared return type for an async function.
+    ///
+    /// For example, if the return type is `impl std::future::Future<Output = i32>`, this function
+    /// will return `i32`.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if the return type does not match the expected sugaring for async
+    /// functions.
+    pub(crate) fn sugared_async_return_type(self) -> Type {
+        if let Type::ImplTrait(mut v) = self
+            && let Some(GenericBound::TraitBound(PolyTrait { mut trait_, .. }, _)) = v.pop()
+            && let Some(segment) = trait_.segments.pop()
+            && let GenericArgs::AngleBracketed { mut constraints, .. } = segment.args
+            && let Some(constraint) = constraints.pop()
+            && let AssocItemConstraintKind::Equality { term } = constraint.kind
+            && let Term::Type(ty) = term
+        {
+            ty
+        } else {
+            panic!("unexpected async fn return type")
+        }
+    }
+
+    /// Checks if this is a `T::Name` path for an associated type.
+    pub(crate) fn is_assoc_ty(&self) -> bool {
+        match self {
+            Type::Path { path, .. } => path.is_assoc_ty(),
             _ => false,
         }
     }
 
-    pub fn is_self_type(&self) -> bool {
-        match *self {
-            Generic(ref name) => name == "Self",
-            _ => false,
-        }
+    pub(crate) fn is_self_type(&self) -> bool {
+        matches!(*self, Type::SelfTy)
     }
 
-    pub fn generics(&self) -> Option<Vec<Type>> {
-        match *self {
-            ResolvedPath { ref path, .. } => path.segments.last().and_then(|seg| {
-                if let GenericArgs::AngleBracketed { ref args, .. } = seg.args {
-                    Some(
-                        args.iter()
-                            .filter_map(|arg| match arg {
-                                GenericArg::Type(ty) => Some(ty.clone()),
-                                _ => None,
-                            })
-                            .collect(),
-                    )
-                } else {
-                    None
-                }
-            }),
+    pub(crate) fn generic_args(&self) -> Option<&GenericArgs> {
+        match self {
+            Type::Path { path, .. } => path.generic_args(),
             _ => None,
         }
     }
 
-    pub fn bindings(&self) -> Option<&[TypeBinding]> {
-        match *self {
-            ResolvedPath { ref path, .. } => path.segments.last().and_then(|seg| {
-                if let GenericArgs::AngleBracketed { ref bindings, .. } = seg.args {
-                    Some(&**bindings)
-                } else {
-                    None
-                }
-            }),
+    pub(crate) fn generics(&self) -> Option<impl Iterator<Item = &Type>> {
+        match self {
+            Type::Path { path, .. } => path.generics(),
             _ => None,
         }
     }
 
-    pub fn is_full_generic(&self) -> bool {
-        match *self {
-            Type::Generic(_) => true,
-            _ => false,
-        }
+    pub(crate) fn is_full_generic(&self) -> bool {
+        matches!(self, Type::Generic(_))
     }
 
-    pub fn projection(&self) -> Option<(&Type, DefId, &str)> {
-        let (self_, trait_, name) = match self {
-            QPath { ref self_type, ref trait_, ref name } => (self_type, trait_, name),
-            _ => return None,
-        };
-        let trait_did = match **trait_ {
-            ResolvedPath { did, .. } => did,
-            _ => return None,
-        };
-        Some((&self_, trait_did, name))
+    pub(crate) fn is_unit(&self) -> bool {
+        matches!(self, Type::Tuple(v) if v.is_empty())
     }
-}
 
-impl GetDefId for Type {
-    fn def_id(&self) -> Option<DefId> {
-        match *self {
-            ResolvedPath { did, .. } => Some(did),
-            Primitive(p) => crate::html::render::cache().primitive_locations.get(&p).cloned(),
-            BorrowedRef { type_: box Generic(..), .. } => {
-                Primitive(PrimitiveType::Reference).def_id()
-            }
-            BorrowedRef { ref type_, .. } => type_.def_id(),
-            Tuple(ref tys) => {
+    /// Use this method to get the [DefId] of a [clean] AST node, including [PrimitiveType]s.
+    ///
+    /// [clean]: crate::clean
+    pub(crate) fn def_id(&self, cache: &Cache) -> Option<DefId> {
+        let t: PrimitiveType = match self {
+            Type::Path { path } => return Some(path.def_id()),
+            DynTrait(bounds, _) => return bounds.first().map(|b| b.trait_.def_id()),
+            Primitive(p) => return cache.primitive_locations.get(p).cloned(),
+            BorrowedRef { type_: box Generic(..), .. } => PrimitiveType::Reference,
+            BorrowedRef { type_, .. } => return type_.def_id(cache),
+            Tuple(tys) => {
                 if tys.is_empty() {
-                    Primitive(PrimitiveType::Unit).def_id()
+                    PrimitiveType::Unit
                 } else {
-                    Primitive(PrimitiveType::Tuple).def_id()
+                    PrimitiveType::Tuple
                 }
             }
-            BareFunction(..) => Primitive(PrimitiveType::Fn).def_id(),
-            Never => Primitive(PrimitiveType::Never).def_id(),
-            Slice(..) => Primitive(PrimitiveType::Slice).def_id(),
-            Array(..) => Primitive(PrimitiveType::Array).def_id(),
-            RawPointer(..) => Primitive(PrimitiveType::RawPointer).def_id(),
-            QPath { ref self_type, .. } => self_type.def_id(),
-            _ => None,
-        }
+            BareFunction(..) => PrimitiveType::Fn,
+            Slice(..) => PrimitiveType::Slice,
+            Array(..) => PrimitiveType::Array,
+            Type::Pat(..) => PrimitiveType::Pat,
+            RawPointer(..) => PrimitiveType::RawPointer,
+            QPath(box QPathData { self_type, .. }) => return self_type.def_id(cache),
+            Generic(_) | SelfTy | Infer | ImplTrait(_) | UnsafeBinder(_) => return None,
+        };
+        Primitive(t).def_id(cache)
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub(crate) struct QPathData {
+    pub assoc: PathSegment,
+    pub self_type: Type,
+    /// FIXME: compute this field on demand.
+    pub should_fully_qualify: bool,
+    pub trait_: Option<Path>,
+}
+
+/// A primitive (aka, builtin) type.
+///
+/// This represents things like `i32`, `str`, etc.
+///
+/// N.B. This has to be different from [`hir::PrimTy`] because it also includes types that aren't
+/// paths, like [`Self::Unit`].
+#[derive(Clone, PartialEq, Eq, Hash, Copy, Debug)]
+pub(crate) enum PrimitiveType {
+    Isize,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    Usize,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    F16,
+    F32,
+    F64,
+    F128,
+    Char,
+    Bool,
+    Str,
+    Slice,
+    Array,
+    Pat,
+    Tuple,
+    Unit,
+    RawPointer,
+    Reference,
+    Fn,
+    Never,
+}
+
+type SimplifiedTypes = FxIndexMap<PrimitiveType, ArrayVec<SimplifiedType, 3>>;
 impl PrimitiveType {
-    pub fn from_str(s: &str) -> Option<PrimitiveType> {
+    pub(crate) fn from_hir(prim: hir::PrimTy) -> PrimitiveType {
+        use ast::{FloatTy, IntTy, UintTy};
+        match prim {
+            hir::PrimTy::Int(IntTy::Isize) => PrimitiveType::Isize,
+            hir::PrimTy::Int(IntTy::I8) => PrimitiveType::I8,
+            hir::PrimTy::Int(IntTy::I16) => PrimitiveType::I16,
+            hir::PrimTy::Int(IntTy::I32) => PrimitiveType::I32,
+            hir::PrimTy::Int(IntTy::I64) => PrimitiveType::I64,
+            hir::PrimTy::Int(IntTy::I128) => PrimitiveType::I128,
+            hir::PrimTy::Uint(UintTy::Usize) => PrimitiveType::Usize,
+            hir::PrimTy::Uint(UintTy::U8) => PrimitiveType::U8,
+            hir::PrimTy::Uint(UintTy::U16) => PrimitiveType::U16,
+            hir::PrimTy::Uint(UintTy::U32) => PrimitiveType::U32,
+            hir::PrimTy::Uint(UintTy::U64) => PrimitiveType::U64,
+            hir::PrimTy::Uint(UintTy::U128) => PrimitiveType::U128,
+            hir::PrimTy::Float(FloatTy::F16) => PrimitiveType::F16,
+            hir::PrimTy::Float(FloatTy::F32) => PrimitiveType::F32,
+            hir::PrimTy::Float(FloatTy::F64) => PrimitiveType::F64,
+            hir::PrimTy::Float(FloatTy::F128) => PrimitiveType::F128,
+            hir::PrimTy::Str => PrimitiveType::Str,
+            hir::PrimTy::Bool => PrimitiveType::Bool,
+            hir::PrimTy::Char => PrimitiveType::Char,
+        }
+    }
+
+    pub(crate) fn from_symbol(s: Symbol) -> Option<PrimitiveType> {
         match s {
-            "isize" => Some(PrimitiveType::Isize),
-            "i8" => Some(PrimitiveType::I8),
-            "i16" => Some(PrimitiveType::I16),
-            "i32" => Some(PrimitiveType::I32),
-            "i64" => Some(PrimitiveType::I64),
-            "i128" => Some(PrimitiveType::I128),
-            "usize" => Some(PrimitiveType::Usize),
-            "u8" => Some(PrimitiveType::U8),
-            "u16" => Some(PrimitiveType::U16),
-            "u32" => Some(PrimitiveType::U32),
-            "u64" => Some(PrimitiveType::U64),
-            "u128" => Some(PrimitiveType::U128),
-            "bool" => Some(PrimitiveType::Bool),
-            "char" => Some(PrimitiveType::Char),
-            "str" => Some(PrimitiveType::Str),
-            "f32" => Some(PrimitiveType::F32),
-            "f64" => Some(PrimitiveType::F64),
-            "array" => Some(PrimitiveType::Array),
-            "slice" => Some(PrimitiveType::Slice),
-            "tuple" => Some(PrimitiveType::Tuple),
-            "unit" => Some(PrimitiveType::Unit),
-            "pointer" => Some(PrimitiveType::RawPointer),
-            "reference" => Some(PrimitiveType::Reference),
-            "fn" => Some(PrimitiveType::Fn),
-            "never" => Some(PrimitiveType::Never),
+            sym::isize => Some(PrimitiveType::Isize),
+            sym::i8 => Some(PrimitiveType::I8),
+            sym::i16 => Some(PrimitiveType::I16),
+            sym::i32 => Some(PrimitiveType::I32),
+            sym::i64 => Some(PrimitiveType::I64),
+            sym::i128 => Some(PrimitiveType::I128),
+            sym::usize => Some(PrimitiveType::Usize),
+            sym::u8 => Some(PrimitiveType::U8),
+            sym::u16 => Some(PrimitiveType::U16),
+            sym::u32 => Some(PrimitiveType::U32),
+            sym::u64 => Some(PrimitiveType::U64),
+            sym::u128 => Some(PrimitiveType::U128),
+            sym::bool => Some(PrimitiveType::Bool),
+            sym::char => Some(PrimitiveType::Char),
+            sym::str => Some(PrimitiveType::Str),
+            sym::f16 => Some(PrimitiveType::F16),
+            sym::f32 => Some(PrimitiveType::F32),
+            sym::f64 => Some(PrimitiveType::F64),
+            sym::f128 => Some(PrimitiveType::F128),
+            sym::array => Some(PrimitiveType::Array),
+            sym::slice => Some(PrimitiveType::Slice),
+            sym::tuple => Some(PrimitiveType::Tuple),
+            sym::unit => Some(PrimitiveType::Unit),
+            sym::pointer => Some(PrimitiveType::RawPointer),
+            sym::reference => Some(PrimitiveType::Reference),
+            kw::Fn => Some(PrimitiveType::Fn),
+            sym::never => Some(PrimitiveType::Never),
             _ => None,
         }
     }
 
-    pub fn as_str(&self) -> &'static str {
-        use self::PrimitiveType::*;
-        match *self {
-            Isize => "isize",
-            I8 => "i8",
-            I16 => "i16",
-            I32 => "i32",
-            I64 => "i64",
-            I128 => "i128",
-            Usize => "usize",
-            U8 => "u8",
-            U16 => "u16",
-            U32 => "u32",
-            U64 => "u64",
-            U128 => "u128",
-            F32 => "f32",
-            F64 => "f64",
-            Str => "str",
-            Bool => "bool",
-            Char => "char",
-            Array => "array",
-            Slice => "slice",
-            Tuple => "tuple",
-            Unit => "unit",
-            RawPointer => "pointer",
-            Reference => "reference",
-            Fn => "fn",
-            Never => "never",
+    pub(crate) fn simplified_types() -> &'static SimplifiedTypes {
+        use PrimitiveType::*;
+        use ty::{FloatTy, IntTy, UintTy};
+        static CELL: OnceCell<SimplifiedTypes> = OnceCell::new();
+
+        let single = |x| iter::once(x).collect();
+        CELL.get_or_init(move || {
+            map! {
+                Isize => single(SimplifiedType::Int(IntTy::Isize)),
+                I8 => single(SimplifiedType::Int(IntTy::I8)),
+                I16 => single(SimplifiedType::Int(IntTy::I16)),
+                I32 => single(SimplifiedType::Int(IntTy::I32)),
+                I64 => single(SimplifiedType::Int(IntTy::I64)),
+                I128 => single(SimplifiedType::Int(IntTy::I128)),
+                Usize => single(SimplifiedType::Uint(UintTy::Usize)),
+                U8 => single(SimplifiedType::Uint(UintTy::U8)),
+                U16 => single(SimplifiedType::Uint(UintTy::U16)),
+                U32 => single(SimplifiedType::Uint(UintTy::U32)),
+                U64 => single(SimplifiedType::Uint(UintTy::U64)),
+                U128 => single(SimplifiedType::Uint(UintTy::U128)),
+                F16 => single(SimplifiedType::Float(FloatTy::F16)),
+                F32 => single(SimplifiedType::Float(FloatTy::F32)),
+                F64 => single(SimplifiedType::Float(FloatTy::F64)),
+                F128 => single(SimplifiedType::Float(FloatTy::F128)),
+                Str => single(SimplifiedType::Str),
+                Bool => single(SimplifiedType::Bool),
+                Char => single(SimplifiedType::Char),
+                Array => single(SimplifiedType::Array),
+                Slice => single(SimplifiedType::Slice),
+                // FIXME: If we ever add an inherent impl for tuples
+                // with different lengths, they won't show in rustdoc.
+                //
+                // Either manually update this arrayvec at this point
+                // or start with a more complex refactoring.
+                Tuple => [SimplifiedType::Tuple(1), SimplifiedType::Tuple(2), SimplifiedType::Tuple(3)].into(),
+                Unit => single(SimplifiedType::Tuple(0)),
+                RawPointer => [SimplifiedType::Ptr(Mutability::Not), SimplifiedType::Ptr(Mutability::Mut)].into_iter().collect(),
+                Reference => [SimplifiedType::Ref(Mutability::Not), SimplifiedType::Ref(Mutability::Mut)].into_iter().collect(),
+                // FIXME: This will be wrong if we ever add inherent impls
+                // for function pointers.
+                Fn => single(SimplifiedType::Function(1)),
+                Never => single(SimplifiedType::Never),
+            }
+        })
+    }
+
+    pub(crate) fn impls<'tcx>(&self, tcx: TyCtxt<'tcx>) -> impl Iterator<Item = DefId> + 'tcx {
+        Self::simplified_types()
+            .get(self)
+            .into_iter()
+            .flatten()
+            .flat_map(move |&simp| tcx.incoherent_impls(simp).iter())
+            .copied()
+    }
+
+    pub(crate) fn all_impls(tcx: TyCtxt<'_>) -> impl Iterator<Item = DefId> {
+        Self::simplified_types()
+            .values()
+            .flatten()
+            .flat_map(move |&simp| tcx.incoherent_impls(simp).iter())
+            .copied()
+    }
+
+    pub(crate) fn as_sym(&self) -> Symbol {
+        use PrimitiveType::*;
+        match self {
+            Isize => sym::isize,
+            I8 => sym::i8,
+            I16 => sym::i16,
+            I32 => sym::i32,
+            I64 => sym::i64,
+            I128 => sym::i128,
+            Usize => sym::usize,
+            U8 => sym::u8,
+            U16 => sym::u16,
+            U32 => sym::u32,
+            U64 => sym::u64,
+            U128 => sym::u128,
+            F16 => sym::f16,
+            F32 => sym::f32,
+            F64 => sym::f64,
+            F128 => sym::f128,
+            Str => sym::str,
+            Bool => sym::bool,
+            Char => sym::char,
+            Array => sym::array,
+            Pat => sym::pat,
+            Slice => sym::slice,
+            Tuple => sym::tuple,
+            Unit => sym::unit,
+            RawPointer => sym::pointer,
+            Reference => sym::reference,
+            Fn => kw::Fn,
+            Never => sym::never,
         }
     }
 
-    pub fn to_url_str(&self) -> &'static str {
-        self.as_str()
+    /// Returns the DefId of the module with `rustc_doc_primitive` for this primitive type.
+    /// Panics if there is no such module.
+    ///
+    /// This gives precedence to primitives defined in the current crate, and deprioritizes
+    /// primitives defined in `core`,
+    /// but otherwise, if multiple crates define the same primitive, there is no guarantee of which
+    /// will be picked.
+    ///
+    /// In particular, if a crate depends on both `std` and another crate that also defines
+    /// `rustc_doc_primitive`, then it's entirely random whether `std` or the other crate is picked.
+    /// (no_std crates are usually fine unless multiple dependencies define a primitive.)
+    pub(crate) fn primitive_locations(tcx: TyCtxt<'_>) -> &FxIndexMap<PrimitiveType, DefId> {
+        static PRIMITIVE_LOCATIONS: OnceCell<FxIndexMap<PrimitiveType, DefId>> = OnceCell::new();
+        PRIMITIVE_LOCATIONS.get_or_init(|| {
+            let mut primitive_locations = FxIndexMap::default();
+            // NOTE: technically this misses crates that are only passed with `--extern` and not loaded when checking the crate.
+            // This is a degenerate case that I don't plan to support.
+            for &crate_num in tcx.crates(()) {
+                let e = ExternalCrate { crate_num };
+                let crate_name = e.name(tcx);
+                debug!(?crate_num, ?crate_name);
+                for (def_id, prim) in e.primitives(tcx) {
+                    // HACK: try to link to std instead where possible
+                    if crate_name == sym::core && primitive_locations.contains_key(&prim) {
+                        continue;
+                    }
+                    primitive_locations.insert(prim, def_id);
+                }
+            }
+            let local_primitives = ExternalCrate { crate_num: LOCAL_CRATE }.primitives(tcx);
+            for (def_id, prim) in local_primitives {
+                primitive_locations.insert(prim, def_id);
+            }
+            primitive_locations
+        })
     }
 }
 
-impl From<ast::IntTy> for PrimitiveType {
-    fn from(int_ty: ast::IntTy) -> PrimitiveType {
+impl From<ty::IntTy> for PrimitiveType {
+    fn from(int_ty: ty::IntTy) -> PrimitiveType {
         match int_ty {
-            ast::IntTy::Isize => PrimitiveType::Isize,
-            ast::IntTy::I8 => PrimitiveType::I8,
-            ast::IntTy::I16 => PrimitiveType::I16,
-            ast::IntTy::I32 => PrimitiveType::I32,
-            ast::IntTy::I64 => PrimitiveType::I64,
-            ast::IntTy::I128 => PrimitiveType::I128,
+            ty::IntTy::Isize => PrimitiveType::Isize,
+            ty::IntTy::I8 => PrimitiveType::I8,
+            ty::IntTy::I16 => PrimitiveType::I16,
+            ty::IntTy::I32 => PrimitiveType::I32,
+            ty::IntTy::I64 => PrimitiveType::I64,
+            ty::IntTy::I128 => PrimitiveType::I128,
         }
     }
 }
 
-impl From<ast::UintTy> for PrimitiveType {
-    fn from(uint_ty: ast::UintTy) -> PrimitiveType {
+impl From<ty::UintTy> for PrimitiveType {
+    fn from(uint_ty: ty::UintTy) -> PrimitiveType {
         match uint_ty {
-            ast::UintTy::Usize => PrimitiveType::Usize,
-            ast::UintTy::U8 => PrimitiveType::U8,
-            ast::UintTy::U16 => PrimitiveType::U16,
-            ast::UintTy::U32 => PrimitiveType::U32,
-            ast::UintTy::U64 => PrimitiveType::U64,
-            ast::UintTy::U128 => PrimitiveType::U128,
+            ty::UintTy::Usize => PrimitiveType::Usize,
+            ty::UintTy::U8 => PrimitiveType::U8,
+            ty::UintTy::U16 => PrimitiveType::U16,
+            ty::UintTy::U32 => PrimitiveType::U32,
+            ty::UintTy::U64 => PrimitiveType::U64,
+            ty::UintTy::U128 => PrimitiveType::U128,
         }
     }
 }
 
-impl From<ast::FloatTy> for PrimitiveType {
-    fn from(float_ty: ast::FloatTy) -> PrimitiveType {
+impl From<ty::FloatTy> for PrimitiveType {
+    fn from(float_ty: ty::FloatTy) -> PrimitiveType {
         match float_ty {
-            ast::FloatTy::F32 => PrimitiveType::F32,
-            ast::FloatTy::F64 => PrimitiveType::F64,
+            ty::FloatTy::F16 => PrimitiveType::F16,
+            ty::FloatTy::F32 => PrimitiveType::F32,
+            ty::FloatTy::F64 => PrimitiveType::F64,
+            ty::FloatTy::F128 => PrimitiveType::F128,
         }
     }
 }
@@ -1310,246 +1850,571 @@ impl From<hir::PrimTy> for PrimitiveType {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Visibility {
-    Public,
-    Inherited,
-    Crate,
-    Restricted(DefId, Path),
+#[derive(Clone, Debug)]
+pub(crate) struct Struct {
+    pub(crate) ctor_kind: Option<CtorKind>,
+    pub(crate) generics: Generics,
+    pub(crate) fields: ThinVec<Item>,
+}
+
+impl Struct {
+    pub(crate) fn has_stripped_entries(&self) -> bool {
+        self.fields.iter().any(|f| f.is_stripped())
+    }
 }
 
 #[derive(Clone, Debug)]
-pub struct Struct {
-    pub struct_type: doctree::StructType,
-    pub generics: Generics,
-    pub fields: Vec<Item>,
-    pub fields_stripped: bool,
+pub(crate) struct Union {
+    pub(crate) generics: Generics,
+    pub(crate) fields: Vec<Item>,
 }
 
-#[derive(Clone, Debug)]
-pub struct Union {
-    pub struct_type: doctree::StructType,
-    pub generics: Generics,
-    pub fields: Vec<Item>,
-    pub fields_stripped: bool,
+impl Union {
+    pub(crate) fn has_stripped_entries(&self) -> bool {
+        self.fields.iter().any(|f| f.is_stripped())
+    }
 }
 
 /// This is a more limited form of the standard Struct, different in that
 /// it lacks the things most items have (name, id, parameterization). Found
 /// only as a variant in an enum.
 #[derive(Clone, Debug)]
-pub struct VariantStruct {
-    pub struct_type: doctree::StructType,
-    pub fields: Vec<Item>,
-    pub fields_stripped: bool,
+pub(crate) struct VariantStruct {
+    pub(crate) fields: ThinVec<Item>,
+}
+
+impl VariantStruct {
+    pub(crate) fn has_stripped_entries(&self) -> bool {
+        self.fields.iter().any(|f| f.is_stripped())
+    }
 }
 
 #[derive(Clone, Debug)]
-pub struct Enum {
-    pub variants: IndexVec<VariantIdx, Item>,
-    pub generics: Generics,
-    pub variants_stripped: bool,
+pub(crate) struct Enum {
+    pub(crate) variants: IndexVec<VariantIdx, Item>,
+    pub(crate) generics: Generics,
+}
+
+impl Enum {
+    pub(crate) fn has_stripped_entries(&self) -> bool {
+        self.variants.iter().any(|f| f.is_stripped())
+    }
+
+    pub(crate) fn non_stripped_variants(&self) -> impl Iterator<Item = &Item> {
+        self.variants.iter().filter(|v| !v.is_stripped())
+    }
 }
 
 #[derive(Clone, Debug)]
-pub struct Variant {
+pub(crate) struct Variant {
     pub kind: VariantKind,
+    pub discriminant: Option<Discriminant>,
 }
 
 #[derive(Clone, Debug)]
-pub enum VariantKind {
+pub(crate) enum VariantKind {
     CLike,
-    Tuple(Vec<Type>),
+    Tuple(ThinVec<Item>),
     Struct(VariantStruct),
 }
 
-#[derive(Clone, Debug)]
-pub struct Span {
-    pub filename: FileName,
-    pub cnum: CrateNum,
-    pub loline: usize,
-    pub locol: usize,
-    pub hiline: usize,
-    pub hicol: usize,
-    pub original: rustc_span::Span,
-}
-
-impl Span {
-    pub fn empty() -> Span {
-        Span {
-            filename: FileName::Anon(0),
-            cnum: LOCAL_CRATE,
-            loline: 0,
-            locol: 0,
-            hiline: 0,
-            hicol: 0,
-            original: rustc_span::DUMMY_SP,
+impl Variant {
+    pub(crate) fn has_stripped_entries(&self) -> Option<bool> {
+        match &self.kind {
+            VariantKind::Struct(struct_) => Some(struct_.has_stripped_entries()),
+            VariantKind::CLike | VariantKind::Tuple(_) => None,
         }
     }
+}
 
-    pub fn span(&self) -> rustc_span::Span {
-        self.original
+#[derive(Clone, Debug)]
+pub(crate) struct Discriminant {
+    // In the case of cross crate re-exports, we don't have the necessary information
+    // to reconstruct the expression of the discriminant, only the value.
+    pub(super) expr: Option<BodyId>,
+    pub(super) value: DefId,
+}
+
+impl Discriminant {
+    /// Will be `None` in the case of cross-crate reexports, and may be
+    /// simplified
+    pub(crate) fn expr(&self, tcx: TyCtxt<'_>) -> Option<String> {
+        self.expr
+            .map(|body| rendered_const(tcx, tcx.hir_body(body), tcx.hir_body_owner_def_id(body)))
+    }
+    pub(crate) fn value(&self, tcx: TyCtxt<'_>, with_underscores: bool) -> String {
+        print_evaluated_const(tcx, self.value, with_underscores, false).unwrap()
+    }
+}
+
+/// Small wrapper around [`rustc_span::Span`] that adds helper methods
+/// and enforces calling [`rustc_span::Span::source_callsite()`].
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Span(rustc_span::Span);
+
+impl Span {
+    /// Wraps a [`rustc_span::Span`]. In case this span is the result of a macro expansion, the
+    /// span will be updated to point to the macro invocation instead of the macro definition.
+    ///
+    /// (See rust-lang/rust#39726)
+    pub(crate) fn new(sp: rustc_span::Span) -> Self {
+        Self(sp.source_callsite())
+    }
+
+    pub(crate) fn inner(&self) -> rustc_span::Span {
+        self.0
+    }
+
+    pub(crate) fn filename(&self, sess: &Session) -> FileName {
+        sess.source_map().span_to_filename(self.0)
+    }
+
+    pub(crate) fn lo(&self, sess: &Session) -> Loc {
+        sess.source_map().lookup_char_pos(self.0.lo())
+    }
+
+    pub(crate) fn hi(&self, sess: &Session) -> Loc {
+        sess.source_map().lookup_char_pos(self.0.hi())
+    }
+
+    pub(crate) fn cnum(&self, sess: &Session) -> CrateNum {
+        // FIXME: is there a time when the lo and hi crate would be different?
+        self.lo(sess).file.cnum
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct Path {
-    pub global: bool,
-    pub res: Res,
-    pub segments: Vec<PathSegment>,
+pub(crate) struct Path {
+    pub(crate) res: Res,
+    pub(crate) segments: ThinVec<PathSegment>,
 }
 
 impl Path {
-    pub fn last_name(&self) -> &str {
-        self.segments.last().expect("segments were empty").name.as_str()
+    pub(crate) fn def_id(&self) -> DefId {
+        self.res.def_id()
+    }
+
+    pub(crate) fn last_opt(&self) -> Option<Symbol> {
+        self.segments.last().map(|s| s.name)
+    }
+
+    pub(crate) fn last(&self) -> Symbol {
+        self.last_opt().expect("segments were empty")
+    }
+
+    pub(crate) fn whole_name(&self) -> String {
+        self.segments
+            .iter()
+            .map(|s| if s.name == kw::PathRoot { "" } else { s.name.as_str() })
+            .intersperse("::")
+            .collect()
+    }
+
+    /// Checks if this is a `T::Name` path for an associated type.
+    pub(crate) fn is_assoc_ty(&self) -> bool {
+        match self.res {
+            Res::SelfTyParam { .. } | Res::SelfTyAlias { .. } | Res::Def(DefKind::TyParam, _)
+                if self.segments.len() != 1 =>
+            {
+                true
+            }
+            Res::Def(DefKind::AssocTy, _) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn generic_args(&self) -> Option<&GenericArgs> {
+        self.segments.last().map(|seg| &seg.args)
+    }
+
+    pub(crate) fn generics(&self) -> Option<impl Iterator<Item = &Type>> {
+        self.segments.last().and_then(|seg| {
+            if let GenericArgs::AngleBracketed { ref args, .. } = seg.args {
+                Some(args.iter().filter_map(|arg| match arg {
+                    GenericArg::Type(ty) => Some(ty),
+                    _ => None,
+                }))
+            } else {
+                None
+            }
+        })
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub enum GenericArg {
+pub(crate) enum GenericArg {
     Lifetime(Lifetime),
     Type(Type),
-    Const(Constant),
+    Const(Box<ConstantKind>),
+    Infer,
+}
+
+impl GenericArg {
+    pub(crate) fn as_lt(&self) -> Option<&Lifetime> {
+        if let Self::Lifetime(lt) = self { Some(lt) } else { None }
+    }
+
+    pub(crate) fn as_ty(&self) -> Option<&Type> {
+        if let Self::Type(ty) = self { Some(ty) } else { None }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub enum GenericArgs {
-    AngleBracketed { args: Vec<GenericArg>, bindings: Vec<TypeBinding> },
-    Parenthesized { inputs: Vec<Type>, output: Option<Type> },
+pub(crate) enum GenericArgs {
+    /// `<args, constraints = ..>`
+    AngleBracketed { args: ThinVec<GenericArg>, constraints: ThinVec<AssocItemConstraint> },
+    /// `(inputs) -> output`
+    Parenthesized { inputs: ThinVec<Type>, output: Option<Box<Type>> },
+    /// `(..)`
+    ReturnTypeNotation,
+}
+
+impl GenericArgs {
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            GenericArgs::AngleBracketed { args, constraints } => {
+                args.is_empty() && constraints.is_empty()
+            }
+            GenericArgs::Parenthesized { inputs, output } => inputs.is_empty() && output.is_none(),
+            GenericArgs::ReturnTypeNotation => false,
+        }
+    }
+    pub(crate) fn constraints(&self) -> Box<dyn Iterator<Item = AssocItemConstraint> + '_> {
+        match self {
+            GenericArgs::AngleBracketed { constraints, .. } => {
+                Box::new(constraints.iter().cloned())
+            }
+            GenericArgs::Parenthesized { output, .. } => Box::new(
+                output
+                    .as_ref()
+                    .map(|ty| AssocItemConstraint {
+                        assoc: PathSegment {
+                            name: sym::Output,
+                            args: GenericArgs::AngleBracketed {
+                                args: ThinVec::new(),
+                                constraints: ThinVec::new(),
+                            },
+                        },
+                        kind: AssocItemConstraintKind::Equality {
+                            term: Term::Type((**ty).clone()),
+                        },
+                    })
+                    .into_iter(),
+            ),
+            GenericArgs::ReturnTypeNotation => Box::new([].into_iter()),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a GenericArgs {
+    type IntoIter = Box<dyn Iterator<Item = GenericArg> + 'a>;
+    type Item = GenericArg;
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            GenericArgs::AngleBracketed { args, .. } => Box::new(args.iter().cloned()),
+            GenericArgs::Parenthesized { inputs, .. } => {
+                // FIXME: This isn't really right, since `Fn(A, B)` is `Fn<(A, B)>`
+                Box::new(inputs.iter().cloned().map(GenericArg::Type))
+            }
+            GenericArgs::ReturnTypeNotation => Box::new([].into_iter()),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct PathSegment {
-    pub name: String,
-    pub args: GenericArgs,
+pub(crate) struct PathSegment {
+    pub(crate) name: Symbol,
+    pub(crate) args: GenericArgs,
 }
 
 #[derive(Clone, Debug)]
-pub struct Typedef {
-    pub type_: Type,
-    pub generics: Generics,
-    // Type of target item.
-    pub item_type: Option<Type>,
+pub(crate) enum TypeAliasInnerType {
+    Enum { variants: IndexVec<VariantIdx, Item>, is_non_exhaustive: bool },
+    Union { fields: Vec<Item> },
+    Struct { ctor_kind: Option<CtorKind>, fields: Vec<Item> },
 }
 
-impl GetDefId for Typedef {
-    fn def_id(&self) -> Option<DefId> {
-        self.type_.def_id()
+impl TypeAliasInnerType {
+    fn has_stripped_entries(&self) -> Option<bool> {
+        Some(match self {
+            Self::Enum { variants, .. } => variants.iter().any(|v| v.is_stripped()),
+            Self::Union { fields } | Self::Struct { fields, .. } => {
+                fields.iter().any(|f| f.is_stripped())
+            }
+        })
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct OpaqueTy {
-    pub bounds: Vec<GenericBound>,
-    pub generics: Generics,
+pub(crate) struct TypeAlias {
+    pub(crate) type_: Type,
+    pub(crate) generics: Generics,
+    /// Inner `AdtDef` type, ie `type TyKind = IrTyKind<Adt, Ty>`,
+    /// to be shown directly on the typedef page.
+    pub(crate) inner_type: Option<TypeAliasInnerType>,
+    /// `type_` can come from either the HIR or from metadata. If it comes from HIR, it may be a type
+    /// alias instead of the final type. This will always have the final type, regardless of whether
+    /// `type_` came from HIR or from metadata.
+    ///
+    /// If `item_type.is_none()`, `type_` is guaranteed to come from metadata (and therefore hold the
+    /// final type).
+    pub(crate) item_type: Option<Type>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct BareFunctionDecl {
-    pub unsafety: hir::Unsafety,
-    pub generic_params: Vec<GenericParamDef>,
-    pub decl: FnDecl,
-    pub abi: Abi,
+pub(crate) struct BareFunctionDecl {
+    pub(crate) safety: hir::Safety,
+    pub(crate) generic_params: Vec<GenericParamDef>,
+    pub(crate) decl: FnDecl,
+    pub(crate) abi: ExternAbi,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub(crate) struct UnsafeBinderTy {
+    pub(crate) generic_params: Vec<GenericParamDef>,
+    pub(crate) ty: Type,
 }
 
 #[derive(Clone, Debug)]
-pub struct Static {
-    pub type_: Type,
-    pub mutability: Mutability,
-    /// It's useful to have the value of a static documented, but I have no
-    /// desire to represent expressions (that'd basically be all of the AST,
-    /// which is huge!). So, have a string.
-    pub expr: String,
+pub(crate) struct Static {
+    pub(crate) type_: Box<Type>,
+    pub(crate) mutability: Mutability,
+    pub(crate) expr: Option<BodyId>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Constant {
-    pub type_: Type,
-    pub expr: String,
-    pub value: Option<String>,
-    pub is_literal: bool,
+pub(crate) struct Constant {
+    pub(crate) generics: Generics,
+    pub(crate) kind: ConstantKind,
+    pub(crate) type_: Type,
 }
 
-#[derive(Clone, PartialEq, Debug)]
-pub enum ImplPolarity {
-    Positive,
-    Negative,
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Term {
+    Type(Type),
+    Constant(ConstantKind),
 }
 
-#[derive(Clone, Debug)]
-pub struct Impl {
-    pub unsafety: hir::Unsafety,
-    pub generics: Generics,
-    pub provided_trait_methods: FxHashSet<String>,
-    pub trait_: Option<Type>,
-    pub for_: Type,
-    pub items: Vec<Item>,
-    pub polarity: Option<ImplPolarity>,
-    pub synthetic: bool,
-    pub blanket_impl: Option<Type>,
+impl Term {
+    pub(crate) fn ty(&self) -> Option<&Type> {
+        if let Term::Type(ty) = self { Some(ty) } else { None }
+    }
 }
 
-#[derive(Clone, Debug)]
-pub enum Import {
-    // use source as str;
-    Simple(String, ImportSource),
-    // use source::*;
-    Glob(ImportSource),
+impl From<Type> for Term {
+    fn from(ty: Type) -> Self {
+        Term::Type(ty)
+    }
 }
 
-#[derive(Clone, Debug)]
-pub struct ImportSource {
-    pub path: Path,
-    pub did: Option<DefId>,
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum ConstantKind {
+    /// This is the wrapper around `ty::Const` for a non-local constant. Because it doesn't have a
+    /// `BodyId`, we need to handle it on its own.
+    ///
+    /// Note that `ty::Const` includes generic parameters, and may not always be uniquely identified
+    /// by a DefId. So this field must be different from `Extern`.
+    TyConst { expr: Box<str> },
+    /// A constant that is just a path (i.e., referring to a const param, free const, etc.).
+    // FIXME: this is an unfortunate representation. rustdoc's logic around consts needs to be improved.
+    Path { path: Box<str> },
+    /// A constant (expression) that's not an item or associated item. These are usually found
+    /// nested inside types (e.g., array lengths) or expressions (e.g., repeat counts), and also
+    /// used to define explicit discriminant values for enum variants.
+    Anonymous { body: BodyId },
+    /// A constant from a different crate.
+    Extern { def_id: DefId },
+    /// `const FOO: u32 = ...;`
+    Local { def_id: DefId, body: BodyId },
+    /// An inferred constant as in `[10u8; _]`.
+    Infer,
 }
 
-#[derive(Clone, Debug)]
-pub struct Macro {
-    pub source: String,
-    pub imported_from: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ProcMacro {
-    pub kind: MacroKind,
-    pub helpers: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Stability {
-    pub level: stability::StabilityLevel,
-    pub feature: Option<String>,
-    pub since: String,
-    pub deprecation: Option<Deprecation>,
-    pub unstable_reason: Option<String>,
-    pub issue: Option<NonZeroU32>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Deprecation {
-    pub since: Option<String>,
-    pub note: Option<String>,
-}
-
-/// An type binding on an associated type (e.g., `A = Bar` in `Foo<A = Bar>` or
-/// `A: Send + Sync` in `Foo<A: Send + Sync>`).
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct TypeBinding {
-    pub name: String,
-    pub kind: TypeBindingKind,
-}
-
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub enum TypeBindingKind {
-    Equality { ty: Type },
-    Constraint { bounds: Vec<GenericBound> },
-}
-
-impl TypeBinding {
-    pub fn ty(&self) -> &Type {
-        match self.kind {
-            TypeBindingKind::Equality { ref ty } => ty,
-            _ => panic!("expected equality type binding for parenthesized generic args"),
+impl ConstantKind {
+    pub(crate) fn expr(&self, tcx: TyCtxt<'_>) -> String {
+        match *self {
+            ConstantKind::TyConst { ref expr } => expr.to_string(),
+            ConstantKind::Path { ref path } => path.to_string(),
+            ConstantKind::Extern { def_id } => print_inlined_const(tcx, def_id),
+            ConstantKind::Local { body, .. } | ConstantKind::Anonymous { body } => {
+                rendered_const(tcx, tcx.hir_body(body), tcx.hir_body_owner_def_id(body))
+            }
+            ConstantKind::Infer => "_".to_string(),
         }
     }
+
+    pub(crate) fn value(&self, tcx: TyCtxt<'_>) -> Option<String> {
+        match *self {
+            ConstantKind::TyConst { .. }
+            | ConstantKind::Path { .. }
+            | ConstantKind::Anonymous { .. }
+            | ConstantKind::Infer => None,
+            ConstantKind::Extern { def_id } | ConstantKind::Local { def_id, .. } => {
+                print_evaluated_const(tcx, def_id, true, true)
+            }
+        }
+    }
+
+    pub(crate) fn is_literal(&self, tcx: TyCtxt<'_>) -> bool {
+        match *self {
+            ConstantKind::TyConst { .. }
+            | ConstantKind::Extern { .. }
+            | ConstantKind::Path { .. }
+            | ConstantKind::Infer => false,
+            ConstantKind::Local { body, .. } | ConstantKind::Anonymous { body } => {
+                is_literal_expr(tcx, body.hir_id)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Impl {
+    pub(crate) safety: hir::Safety,
+    pub(crate) generics: Generics,
+    pub(crate) trait_: Option<Path>,
+    pub(crate) for_: Type,
+    pub(crate) items: Vec<Item>,
+    pub(crate) polarity: ty::ImplPolarity,
+    pub(crate) kind: ImplKind,
+}
+
+impl Impl {
+    pub(crate) fn provided_trait_methods(&self, tcx: TyCtxt<'_>) -> FxIndexSet<Symbol> {
+        self.trait_
+            .as_ref()
+            .map(|t| t.def_id())
+            .map(|did| tcx.provided_trait_methods(did).map(|meth| meth.name()).collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn is_negative_trait_impl(&self) -> bool {
+        matches!(self.polarity, ty::ImplPolarity::Negative)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ImplKind {
+    Normal,
+    Auto,
+    FakeVariadic,
+    Blanket(Box<Type>),
+}
+
+impl ImplKind {
+    pub(crate) fn is_auto(&self) -> bool {
+        matches!(self, ImplKind::Auto)
+    }
+
+    pub(crate) fn is_blanket(&self) -> bool {
+        matches!(self, ImplKind::Blanket(_))
+    }
+
+    pub(crate) fn is_fake_variadic(&self) -> bool {
+        matches!(self, ImplKind::FakeVariadic)
+    }
+
+    pub(crate) fn as_blanket_ty(&self) -> Option<&Type> {
+        match self {
+            ImplKind::Blanket(ty) => Some(ty),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Import {
+    pub(crate) kind: ImportKind,
+    /// The item being re-exported.
+    pub(crate) source: ImportSource,
+    pub(crate) should_be_displayed: bool,
+}
+
+impl Import {
+    pub(crate) fn new_simple(
+        name: Symbol,
+        source: ImportSource,
+        should_be_displayed: bool,
+    ) -> Self {
+        Self { kind: ImportKind::Simple(name), source, should_be_displayed }
+    }
+
+    pub(crate) fn new_glob(source: ImportSource, should_be_displayed: bool) -> Self {
+        Self { kind: ImportKind::Glob, source, should_be_displayed }
+    }
+
+    pub(crate) fn imported_item_is_doc_hidden(&self, tcx: TyCtxt<'_>) -> bool {
+        self.source.did.is_some_and(|did| tcx.is_doc_hidden(did))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ImportKind {
+    // use source as str;
+    Simple(Symbol),
+    // use source::*;
+    Glob,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ImportSource {
+    pub(crate) path: Path,
+    pub(crate) did: Option<DefId>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Macro {
+    pub(crate) source: String,
+    /// Whether the macro was defined via `macro_rules!` as opposed to `macro`.
+    pub(crate) macro_rules: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProcMacro {
+    pub(crate) kind: MacroKind,
+    pub(crate) helpers: Vec<Symbol>,
+}
+
+/// A constraint on an associated item.
+///
+/// ### Examples
+///
+/// * the `A = Ty` and `B = Ty` in `Trait<A = Ty, B = Ty>`
+/// * the `G<Ty> = Ty` in `Trait<G<Ty> = Ty>`
+/// * the `A: Bound` in `Trait<A: Bound>`
+/// * the `RetTy` in `Trait(ArgTy, ArgTy) -> RetTy`
+/// * the `C = { Ct }` in `Trait<C = { Ct }>` (feature `associated_const_equality`)
+/// * the `f(..): Bound` in `Trait<f(..): Bound>` (feature `return_type_notation`)
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub(crate) struct AssocItemConstraint {
+    pub(crate) assoc: PathSegment,
+    pub(crate) kind: AssocItemConstraintKind,
+}
+
+/// The kind of [associated item constraint][AssocItemConstraint].
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub(crate) enum AssocItemConstraintKind {
+    Equality { term: Term },
+    Bound { bounds: Vec<GenericBound> },
+}
+
+// Some nodes are used a lot. Make sure they don't unintentionally get bigger.
+#[cfg(target_pointer_width = "64")]
+mod size_asserts {
+    use rustc_data_structures::static_assert_size;
+
+    use super::*;
+    // tidy-alphabetical-start
+    static_assert_size!(Crate, 16); // frequently moved by-value
+    static_assert_size!(DocFragment, 32);
+    static_assert_size!(GenericArg, 32);
+    static_assert_size!(GenericArgs, 24);
+    static_assert_size!(GenericParamDef, 40);
+    static_assert_size!(Generics, 16);
+    static_assert_size!(Item, 8);
+    static_assert_size!(ItemInner, 144);
+    static_assert_size!(ItemKind, 48);
+    static_assert_size!(PathSegment, 32);
+    static_assert_size!(Type, 32);
+    // tidy-alphabetical-end
 }

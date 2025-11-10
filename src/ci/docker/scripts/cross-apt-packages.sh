@@ -1,4 +1,5 @@
-apt-get update && apt-get install -y --no-install-recommends \
+#!/bin/sh
+apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   automake \
   bison \
   bzip2 \
@@ -17,9 +18,11 @@ apt-get update && apt-get install -y --no-install-recommends \
   libssl-dev \
   libtool-bin \
   make \
+  ninja-build \
   patch \
   pkg-config \
   python3 \
+  rsync \
   sudo \
   texinfo \
   unzip \

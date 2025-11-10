@@ -1,4 +1,4 @@
-// run-pass
+//@ check-pass
 
 #![warn(clippy::use_self)]
 

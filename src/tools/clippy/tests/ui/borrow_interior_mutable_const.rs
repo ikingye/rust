@@ -1,85 +1,237 @@
-#![warn(clippy::borrow_interior_mutable_const)]
-#![allow(clippy::declare_interior_mutable_const, clippy::ref_in_deref)]
+//@aux-build:interior_mutable_const.rs
 
-use std::borrow::Cow;
-use std::cell::Cell;
-use std::fmt::Display;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Once;
+#![deny(clippy::borrow_interior_mutable_const)]
+#![allow(
+    clippy::declare_interior_mutable_const,
+    clippy::out_of_bounds_indexing,
+    const_item_mutation,
+    unconditional_panic
+)]
 
-const ATOMIC: AtomicUsize = AtomicUsize::new(5);
-const CELL: Cell<usize> = Cell::new(6);
-const ATOMIC_TUPLE: ([AtomicUsize; 1], Vec<AtomicUsize>, u8) = ([ATOMIC], Vec::new(), 7);
-const INTEGER: u8 = 8;
-const STRING: String = String::new();
-const STR: &str = "012345";
-const COW: Cow<str> = Cow::Borrowed("abcdef");
-const NO_ANN: &dyn Display = &70;
-static STATIC_TUPLE: (AtomicUsize, String) = (ATOMIC, STRING);
-const ONCE_INIT: Once = Once::new();
+use core::cell::{Cell, UnsafeCell};
+use core::ops::{Deref, Index};
 
-trait Trait<T>: Copy {
-    type NonCopyType;
-
-    const ATOMIC: AtomicUsize;
+trait ConstDefault {
+    const DEFAULT: Self;
 }
-
-impl Trait<u32> for u64 {
-    type NonCopyType = u16;
-
-    const ATOMIC: AtomicUsize = AtomicUsize::new(9);
+impl ConstDefault for u32 {
+    const DEFAULT: Self = 0;
+}
+impl<T: ConstDefault> ConstDefault for Cell<T> {
+    const DEFAULT: Self = Cell::new(T::DEFAULT);
 }
 
 fn main() {
-    ATOMIC.store(1, Ordering::SeqCst); //~ ERROR interior mutability
-    assert_eq!(ATOMIC.load(Ordering::SeqCst), 5); //~ ERROR interior mutability
+    {
+        const C: String = String::new();
+        let _ = C;
+        let _ = &C;
+        let _ = C.len();
+        let _ = &*C;
+    }
+    {
+        const C: UnsafeCell<u32> = UnsafeCell::new(0);
+        let _ = C;
+        let _ = &C; //~ borrow_interior_mutable_const
+        let _ = C.into_inner();
+        let _ = C.get(); //~ borrow_interior_mutable_const
+    }
+    {
+        const C: Cell<u32> = Cell::new(0);
+        let _ = C;
+        let _ = &C; //~ borrow_interior_mutable_const
+        let _ = &mut C; //~ borrow_interior_mutable_const
+        let _ = C.into_inner();
 
-    let _once = ONCE_INIT;
-    let _once_ref = &ONCE_INIT; //~ ERROR interior mutability
-    let _once_ref_2 = &&ONCE_INIT; //~ ERROR interior mutability
-    let _once_ref_4 = &&&&ONCE_INIT; //~ ERROR interior mutability
-    let _once_mut = &mut ONCE_INIT; //~ ERROR interior mutability
-    let _atomic_into_inner = ATOMIC.into_inner();
-    // these should be all fine.
-    let _twice = (ONCE_INIT, ONCE_INIT);
-    let _ref_twice = &(ONCE_INIT, ONCE_INIT);
-    let _ref_once = &(ONCE_INIT, ONCE_INIT).0;
-    let _array_twice = [ONCE_INIT, ONCE_INIT];
-    let _ref_array_twice = &[ONCE_INIT, ONCE_INIT];
-    let _ref_array_once = &[ONCE_INIT, ONCE_INIT][0];
+        let local = C;
+        C.swap(&local) //~ borrow_interior_mutable_const
+    }
+    {
+        const C: [(Cell<u32>,); 1] = [(Cell::new(0),)];
+        let _ = C;
+        let _ = &C; //~ borrow_interior_mutable_const
+        let _ = &C[0]; //~ borrow_interior_mutable_const
+        let _ = &C[0].0; //~ borrow_interior_mutable_const
+        C[0].0.set(1); //~ borrow_interior_mutable_const
+    }
+    {
+        struct S(Cell<u32>);
+        impl S {
+            const C: Self = Self(Cell::new(0));
+        }
+        impl Deref for S {
+            type Target = Cell<u32>;
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+        let _ = S::C;
+        let _ = S::C.0;
+        let _ = &S::C; //~ borrow_interior_mutable_const
+        let _ = &S::C.0; //~ borrow_interior_mutable_const
+        S::C.set(1); //~ borrow_interior_mutable_const
+        let _ = &*S::C; //~ borrow_interior_mutable_const
+        (*S::C).set(1); //~ borrow_interior_mutable_const
+    }
+    {
+        enum E {
+            Cell(Cell<u32>),
+            Other,
+        }
+        const CELL: E = E::Cell(Cell::new(0));
+        const OTHER: E = E::Other;
 
-    // referencing projection is still bad.
-    let _ = &ATOMIC_TUPLE; //~ ERROR interior mutability
-    let _ = &ATOMIC_TUPLE.0; //~ ERROR interior mutability
-    let _ = &(&&&&ATOMIC_TUPLE).0; //~ ERROR interior mutability
-    let _ = &ATOMIC_TUPLE.0[0]; //~ ERROR interior mutability
-    let _ = ATOMIC_TUPLE.0[0].load(Ordering::SeqCst); //~ ERROR interior mutability
-    let _ = &*ATOMIC_TUPLE.1; //~ ERROR interior mutability
-    let _ = &ATOMIC_TUPLE.2;
-    let _ = (&&&&ATOMIC_TUPLE).0;
-    let _ = (&&&&ATOMIC_TUPLE).2;
-    let _ = ATOMIC_TUPLE.0;
-    let _ = ATOMIC_TUPLE.0[0]; //~ ERROR interior mutability
-    let _ = ATOMIC_TUPLE.1.into_iter();
-    let _ = ATOMIC_TUPLE.2;
-    let _ = &{ ATOMIC_TUPLE };
+        let _ = CELL;
+        let _ = &CELL; //~ borrow_interior_mutable_const
+        let E::Cell(_) = CELL else {
+            return;
+        };
 
-    CELL.set(2); //~ ERROR interior mutability
-    assert_eq!(CELL.get(), 6); //~ ERROR interior mutability
+        let _ = OTHER;
+        let _ = &OTHER;
+        let E::Cell(ref _x) = OTHER else {
+            return;
+        };
+    }
+    {
+        struct S<T> {
+            cell: (Cell<T>, u32),
+            other: Option<T>,
+        }
+        impl<T: ConstDefault + Copy> S<T> {
+            const C: Self = Self {
+                cell: (Cell::<T>::DEFAULT, 0),
+                other: Some(T::DEFAULT),
+            };
 
-    assert_eq!(INTEGER, 8);
-    assert!(STRING.is_empty());
+            fn f() {
+                let _ = Self::C;
+                let _ = &Self::C; //~ borrow_interior_mutable_const
+                let _ = Self::C.other;
+                let _ = &Self::C.other;
+                let _ = &Self::C.cell; //~ borrow_interior_mutable_const
+                let _ = &Self::C.cell.0; //~ borrow_interior_mutable_const
+                Self::C.cell.0.set(T::DEFAULT); //~ borrow_interior_mutable_const
+                let _ = &Self::C.cell.1;
+            }
+        }
+    }
+    {
+        trait T {
+            const VALUE: Option<Cell<u32>> = Some(Cell::new(0));
+        }
+        impl T for u32 {}
+        impl T for i32 {
+            const VALUE: Option<Cell<u32>> = None;
+        }
 
-    let a = ATOMIC;
-    a.store(4, Ordering::SeqCst);
-    assert_eq!(a.load(Ordering::SeqCst), 4);
+        let _ = &u32::VALUE; //~ borrow_interior_mutable_const
+        let _ = &i32::VALUE;
+    }
+    {
+        trait Trait<T: ConstDefault> {
+            type T<U: ConstDefault>: ConstDefault;
+            const VALUE: Option<Self::T<T>> = Some(Self::T::<T>::DEFAULT);
+        }
+        impl<T: ConstDefault> Trait<T> for u32 {
+            type T<U: ConstDefault> = Cell<U>;
+        }
+        impl<T: ConstDefault> Trait<T> for i32 {
+            type T<U: ConstDefault> = Cell<U>;
+            const VALUE: Option<Cell<T>> = None;
+        }
 
-    STATIC_TUPLE.0.store(3, Ordering::SeqCst);
-    assert_eq!(STATIC_TUPLE.0.load(Ordering::SeqCst), 3);
-    assert!(STATIC_TUPLE.1.is_empty());
+        fn f<T: ConstDefault>() {
+            let _ = &<u32 as Trait<T>>::VALUE; //~ borrow_interior_mutable_const
+            let _ = &<i32 as Trait<T>>::VALUE;
+        }
+    }
+    {
+        trait Trait {
+            const UNFROZEN: Option<Cell<u32>> = Some(Cell::new(0));
+            const FROZEN: Option<Cell<u32>> = None;
+            const NON_FREEZE: u32 = 0;
+        }
+        fn f<T: Trait>() {
+            // None of these are guaranteed to be frozen, so don't lint.
+            let _ = &T::UNFROZEN;
+            let _ = &T::FROZEN;
+            let _ = &T::NON_FREEZE;
+        }
+    }
+    {
+        struct S([Option<Cell<u32>>; 2]);
+        impl Index<usize> for S {
+            type Output = Option<Cell<u32>>;
+            fn index(&self, idx: usize) -> &Self::Output {
+                &self.0[idx]
+            }
+        }
 
-    u64::ATOMIC.store(5, Ordering::SeqCst); //~ ERROR interior mutability
-    assert_eq!(u64::ATOMIC.load(Ordering::SeqCst), 9); //~ ERROR interior mutability
+        const C: S = S([Some(Cell::new(0)), None]);
+        let _ = &C; //~ borrow_interior_mutable_const
+        let _ = &C[0]; //~ borrow_interior_mutable_const
+        let _ = &C.0[0]; //~ borrow_interior_mutable_const
+        let _ = &C.0[1];
+    }
+    {
+        const C: [Option<Cell<u32>>; 2] = [None, None];
+        let _ = &C[0];
+        let _ = &C[1];
+        let _ = &C[2];
 
-    assert_eq!(NO_ANN.to_string(), "70"); // should never lint this.
+        fn f(i: usize) {
+            let _ = &C[i];
+        }
+    }
+    {
+        const C: [Option<Cell<u32>>; 2] = [None, Some(Cell::new(0))];
+        let _ = &C[0];
+        let _ = &C[1]; //~ borrow_interior_mutable_const
+        let _ = &C[2];
+
+        fn f(i: usize) {
+            let _ = &C[i]; //~ borrow_interior_mutable_const
+        }
+    }
+    {
+        let _ = &interior_mutable_const::WRAPPED_PRIVATE_UNFROZEN_VARIANT; //~ borrow_interior_mutable_const
+        let _ = &interior_mutable_const::WRAPPED_PRIVATE_FROZEN_VARIANT;
+    }
+    {
+        type Cell2<T> = Cell<T>;
+        type MyCell = Cell2<u32>;
+        struct S(Option<MyCell>);
+        trait T {
+            type Assoc;
+        }
+        struct S2<T>(T, T, u32);
+        impl T for S {
+            type Assoc = S2<Self>;
+        }
+        type Assoc<X> = <X as T>::Assoc;
+        impl S {
+            const VALUE: Assoc<Self> = S2(Self(None), Self(Some(Cell::new(0))), 0);
+        }
+        let _ = &S::VALUE; //~ borrow_interior_mutable_const
+        let _ = &S::VALUE.0;
+        let _ = &S::VALUE.1; //~ borrow_interior_mutable_const
+        let _ = &S::VALUE.2;
+    }
+    {
+        pub struct Foo<T, const N: usize>(pub Entry<N>, pub T);
+
+        pub struct Entry<const N: usize>(pub Cell<[u32; N]>);
+
+        impl<const N: usize> Entry<N> {
+            const INIT: Self = Self(Cell::new([42; N]));
+        }
+
+        impl<T, const N: usize> Foo<T, N> {
+            pub fn make_foo(v: T) -> Self {
+                // Used to ICE due to incorrect instantiation.
+                Foo(Entry::INIT, v)
+            }
+        }
+    }
 }

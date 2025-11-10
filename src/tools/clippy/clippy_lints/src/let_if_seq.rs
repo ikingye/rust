@@ -1,23 +1,22 @@
-use crate::utils::{higher, qpath_res, snippet, span_lint_and_then};
-use if_chain::if_chain;
+use clippy_utils::diagnostics::span_lint_hir_and_then;
+use clippy_utils::res::MaybeResPath;
+use clippy_utils::source::snippet;
+use clippy_utils::visitors::is_local_used;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
-use rustc_hir::def::Res;
-use rustc_hir::intravisit;
-use rustc_hir::BindingAnnotation;
+use rustc_hir::{BindingMode, Mutability};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::hir::map::Map;
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for variable declarations immediately followed by a
+    /// ### What it does
+    /// Checks for variable declarations immediately followed by a
     /// conditional affectation.
     ///
-    /// **Why is this bad?** This is not idiomatic Rust.
+    /// ### Why is this bad?
+    /// This is not idiomatic Rust.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
+    /// ### Example
     /// ```rust,ignore
     /// let foo;
     ///
@@ -49,6 +48,7 @@ declare_clippy_lint! {
     ///     None
     /// };
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub USELESS_LET_IF_SEQ,
     nursery,
     "unidiomatic `let mut` declaration followed by initialization in `if`"
@@ -56,150 +56,108 @@ declare_clippy_lint! {
 
 declare_lint_pass!(LetIfSeq => [USELESS_LET_IF_SEQ]);
 
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for LetIfSeq {
-    fn check_block(&mut self, cx: &LateContext<'a, 'tcx>, block: &'tcx hir::Block<'_>) {
-        let mut it = block.stmts.iter().peekable();
-        while let Some(stmt) = it.next() {
-            if_chain! {
-                if let Some(expr) = it.peek();
-                if let hir::StmtKind::Local(ref local) = stmt.kind;
-                if let hir::PatKind::Binding(mode, canonical_id, ident, None) = local.pat.kind;
-                if let hir::StmtKind::Expr(ref if_) = expr.kind;
-                if let Some((ref cond, ref then, ref else_)) = higher::if_block(&if_);
-                if !used_in_expr(cx, canonical_id, cond);
-                if let hir::ExprKind::Block(ref then, _) = then.kind;
-                if let Some(value) = check_assign(cx, canonical_id, &*then);
-                if !used_in_expr(cx, canonical_id, value);
-                then {
-                    let span = stmt.span.to(if_.span);
+impl<'tcx> LateLintPass<'tcx> for LetIfSeq {
+    fn check_block(&mut self, cx: &LateContext<'tcx>, block: &'tcx hir::Block<'_>) {
+        for [stmt, next] in block.stmts.array_windows::<2>() {
+            if let hir::StmtKind::Let(local) = stmt.kind
+                && let hir::PatKind::Binding(mode, canonical_id, ident, None) = local.pat.kind
+                && let hir::StmtKind::Expr(if_) = next.kind
+                && let hir::ExprKind::If(cond, then, else_) = if_.kind
+                && !is_local_used(cx, cond, canonical_id)
+                && let hir::ExprKind::Block(then, _) = then.kind
+                && let Some(value) = check_assign(cx, canonical_id, then)
+                && !is_local_used(cx, value, canonical_id)
+            {
+                let span = stmt.span.to(if_.span);
 
-                    let has_interior_mutability = !cx.tables.node_type(canonical_id).is_freeze(
-                        cx.tcx,
-                        cx.param_env,
-                        span
-                    );
-                    if has_interior_mutability { return; }
+                let has_interior_mutability = !cx
+                    .typeck_results()
+                    .node_type(canonical_id)
+                    .is_freeze(cx.tcx, cx.typing_env());
+                if has_interior_mutability {
+                    return;
+                }
 
-                    let (default_multi_stmts, default) = if let Some(ref else_) = *else_ {
-                        if let hir::ExprKind::Block(ref else_, _) = else_.kind {
-                            if let Some(default) = check_assign(cx, canonical_id, else_) {
-                                (else_.stmts.len() > 1, default)
-                            } else if let Some(ref default) = local.init {
-                                (true, &**default)
-                            } else {
-                                continue;
-                            }
+                let (default_multi_stmts, default) = if let Some(else_) = else_ {
+                    if let hir::ExprKind::Block(else_, _) = else_.kind {
+                        if let Some(default) = check_assign(cx, canonical_id, else_) {
+                            (else_.stmts.len() > 1, default)
+                        } else if let Some(default) = local.init {
+                            (true, default)
                         } else {
                             continue;
                         }
-                    } else if let Some(ref default) = local.init {
-                        (false, &**default)
                     } else {
                         continue;
-                    };
+                    }
+                } else if let Some(default) = local.init {
+                    (false, default)
+                } else {
+                    continue;
+                };
 
-                    let mutability = match mode {
-                        BindingAnnotation::RefMut | BindingAnnotation::Mutable => "<mut> ",
-                        _ => "",
-                    };
+                let mutability = match mode {
+                    BindingMode(_, Mutability::Mut) => "<mut> ",
+                    _ => "",
+                };
 
-                    // FIXME: this should not suggest `mut` if we can detect that the variable is not
-                    // use mutably after the `if`
+                // FIXME: this should not suggest `mut` if we can detect that the variable is not
+                // use mutably after the `if`
 
-                    let sug = format!(
-                        "let {mut}{name} = if {cond} {{{then} {value} }} else {{{else} {default} }};",
-                        mut=mutability,
-                        name=ident.name,
-                        cond=snippet(cx, cond.span, "_"),
-                        then=if then.stmts.len() > 1 { " ..;" } else { "" },
-                        else=if default_multi_stmts { " ..;" } else { "" },
-                        value=snippet(cx, value.span, "<value>"),
-                        default=snippet(cx, default.span, "<default>"),
-                    );
-                    span_lint_and_then(cx,
-                                       USELESS_LET_IF_SEQ,
-                                       span,
-                                       "`if _ { .. } else { .. }` is an expression",
-                                       |diag| {
-                                           diag.span_suggestion(
-                                                span,
-                                                "it is more idiomatic to write",
-                                                sug,
-                                                Applicability::HasPlaceholders,
-                                            );
-                                           if !mutability.is_empty() {
-                                               diag.note("you might not need `mut` at all");
-                                           }
-                                       });
-                }
+                let sug = format!(
+                    "let {mutability}{name} = if {cond} {{{then} {value} }} else {{{else} {default} }};",
+                    name=ident.name,
+                    cond=snippet(cx, cond.span, "_"),
+                    then=if then.stmts.len() > 1 { " ..;" } else { "" },
+                    else=if default_multi_stmts { " ..;" } else { "" },
+                    value=snippet(cx, value.span, "<value>"),
+                    default=snippet(cx, default.span, "<default>"),
+                );
+                span_lint_hir_and_then(
+                    cx,
+                    USELESS_LET_IF_SEQ,
+                    local.hir_id,
+                    span,
+                    "`if _ { .. } else { .. }` is an expression",
+                    |diag| {
+                        diag.span_suggestion(
+                            span,
+                            "it is more idiomatic to write",
+                            sug,
+                            Applicability::HasPlaceholders,
+                        );
+                        if !mutability.is_empty() {
+                            diag.note("you might not need `mut` at all");
+                        }
+                    },
+                );
             }
         }
     }
 }
 
-struct UsedVisitor<'a, 'tcx> {
-    cx: &'a LateContext<'a, 'tcx>,
-    id: hir::HirId,
-    used: bool,
-}
-
-impl<'a, 'tcx> intravisit::Visitor<'tcx> for UsedVisitor<'a, 'tcx> {
-    type Map = Map<'tcx>;
-
-    fn visit_expr(&mut self, expr: &'tcx hir::Expr<'_>) {
-        if_chain! {
-            if let hir::ExprKind::Path(ref qpath) = expr.kind;
-            if let Res::Local(local_id) = qpath_res(self.cx, qpath, expr.hir_id);
-            if self.id == local_id;
-            then {
-                self.used = true;
-                return;
-            }
-        }
-        intravisit::walk_expr(self, expr);
-    }
-    fn nested_visit_map(&mut self) -> intravisit::NestedVisitorMap<Self::Map> {
-        intravisit::NestedVisitorMap::None
-    }
-}
-
-fn check_assign<'a, 'tcx>(
-    cx: &LateContext<'a, 'tcx>,
+fn check_assign<'tcx>(
+    cx: &LateContext<'tcx>,
     decl: hir::HirId,
     block: &'tcx hir::Block<'_>,
 ) -> Option<&'tcx hir::Expr<'tcx>> {
-    if_chain! {
-        if block.expr.is_none();
-        if let Some(expr) = block.stmts.iter().last();
-        if let hir::StmtKind::Semi(ref expr) = expr.kind;
-        if let hir::ExprKind::Assign(ref var, ref value, _) = expr.kind;
-        if let hir::ExprKind::Path(ref qpath) = var.kind;
-        if let Res::Local(local_id) = qpath_res(cx, qpath, var.hir_id);
-        if decl == local_id;
-        then {
-            let mut v = UsedVisitor {
-                cx,
-                id: decl,
-                used: false,
-            };
-
-            for s in block.stmts.iter().take(block.stmts.len()-1) {
-                intravisit::walk_stmt(&mut v, s);
-
-                if v.used {
-                    return None;
-                }
-            }
-
-            return Some(value);
+    if block.expr.is_none()
+        && let Some(expr) = block.stmts.iter().last()
+        && let hir::StmtKind::Semi(expr) = expr.kind
+        && let hir::ExprKind::Assign(var, value, _) = expr.kind
+        && var.res_local_id() == Some(decl)
+    {
+        if block
+            .stmts
+            .iter()
+            .take(block.stmts.len() - 1)
+            .any(|stmt| is_local_used(cx, stmt, decl))
+        {
+            None
+        } else {
+            Some(value)
         }
+    } else {
+        None
     }
-
-    None
-}
-
-fn used_in_expr<'a, 'tcx>(cx: &LateContext<'a, 'tcx>, id: hir::HirId, expr: &'tcx hir::Expr<'_>) -> bool {
-    let mut v = UsedVisitor { cx, id, used: false };
-    intravisit::walk_expr(&mut v, expr);
-    v.used
 }

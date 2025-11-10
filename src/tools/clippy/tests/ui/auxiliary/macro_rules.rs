@@ -1,33 +1,13 @@
 #![allow(dead_code)]
 
 //! Used to test that certain lints don't trigger in imported external macros
-
-#[macro_export]
-macro_rules! foofoo {
-    () => {
-        loop {}
-    };
-}
-
-#[macro_export]
-macro_rules! must_use_unit {
-    () => {
-        #[must_use]
-        fn foo() {}
-    };
-}
-
 #[macro_export]
 macro_rules! try_err {
     () => {
         pub fn try_err_fn() -> Result<i32, i32> {
             let err: i32 = 1;
             // To avoid warnings during rustfix
-            if true {
-                Err(err)?
-            } else {
-                Ok(2)
-            }
+            if true { Err(err)? } else { Ok(2) }
         }
     };
 }
@@ -41,18 +21,51 @@ macro_rules! string_add {
 }
 
 #[macro_export]
-macro_rules! take_external {
-    ($s:expr) => {
-        std::mem::replace($s, Default::default())
+macro_rules! string_lit_as_bytes {
+    ($s:literal) => {
+        const C: &[u8] = $s.as_bytes();
     };
 }
 
 #[macro_export]
-macro_rules! option_env_unwrap_external {
-    ($env: expr) => {
-        option_env!($env).unwrap()
+macro_rules! mut_mut {
+    () => {
+        let mut_mut_ty: &mut &mut u32 = &mut &mut 1u32;
     };
-    ($env: expr, $message: expr) => {
-        option_env!($env).expect($message)
+}
+
+#[macro_export]
+macro_rules! issue_10421 {
+    () => {
+        let mut a = 1;
+        let mut b = 2;
+        a = b;
+        b = a;
     };
+}
+
+#[macro_export]
+macro_rules! macro_with_panic {
+    () => {
+        panic!()
+    };
+}
+
+#[macro_export]
+macro_rules! bad_transmute {
+    ($e:expr) => {
+        std::mem::transmute($e)
+    };
+}
+
+#[macro_export]
+#[rustfmt::skip]
+macro_rules! double_parens {
+    ($a:expr, $b:expr, $c:expr, $d:expr) => {{
+        let a = ($a);
+        let a = (());
+        let b = ((5));
+        let c = std::convert::identity((5));
+        InterruptMask((($a.union($b).union($c).union($d)).into_bits()) as u32)
+    }};
 }

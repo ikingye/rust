@@ -5,6 +5,8 @@ title: Tracking Issue for XXX
 labels: C-tracking-issue
 ---
 <!--
+NOTE: For library features, please use the "Library Tracking Issue" template instead.
+
 Thank you for creating a tracking issue! 📜 Tracking issues are for tracking a
 feature from implementation to stabilisation. Make sure to include the relevant
 RFC for the feature if it has one. Otherwise provide a short summary of the
@@ -23,9 +25,11 @@ The feature gate for the issue is `#![feature(FFF)]`.
 ### About tracking issues
 
 Tracking issues are used to record the overall progress of implementation.
-They are also uses as hubs connecting to other relevant issues, e.g., bugs or open design questions.
+They are also used as hubs connecting to other relevant issues, e.g., bugs or open design questions.
 A tracking issue is however *not* meant for large scale discussion, questions, or bug reports about a feature.
 Instead, open a dedicated issue for the specific matter and add the relevant feature gate label.
+Discussion comments will get marked as off-topic or deleted.
+Repeated discussions on the tracking issue may lead to the tracking issue getting locked.
 
 ### Steps
 <!--
@@ -37,10 +41,16 @@ for larger features an implementation could be broken up into multiple PRs.
 - [ ] Implement the RFC (cc @rust-lang/XXX -- can anyone write up mentoring
       instructions?)
 - [ ] Adjust documentation ([see instructions on rustc-dev-guide][doc-guide])
+- [ ] Style updates for any new syntax ([nightly-style-procedure])
+  - [ ] Style team decision on new formatting
+  - [ ] Formatting for new syntax has been added to the [Style Guide]
+  - [ ] (non-blocking) Formatting has been implemented in `rustfmt`
 - [ ] Stabilization PR ([see instructions on rustc-dev-guide][stabilization-guide])
 
 [stabilization-guide]: https://rustc-dev-guide.rust-lang.org/stabilization_guide.html#stabilization-pr
 [doc-guide]: https://rustc-dev-guide.rust-lang.org/stabilization_guide.html#documentation-prs
+[nightly-style-procedure]: https://github.com/rust-lang/style-team/blob/main/nightly-style-procedure.md 
+[Style Guide]: https://github.com/rust-lang/rust/tree/HEAD/src/doc/style-guide
 
 ### Unresolved Questions
 <!--

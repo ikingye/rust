@@ -1,4 +1,4 @@
-// run-rustfix
+#![expect(clippy::unnecessary_cast, clippy::useless_vec, clippy::needless_borrow)]
 
 fn main() {
     let vec = vec![b'a', b'b', b'c'];
@@ -9,12 +9,34 @@ fn main() {
     let offset_isize = 1_isize;
 
     unsafe {
-        ptr.offset(offset_usize as isize);
-        ptr.offset(offset_isize as isize);
-        ptr.offset(offset_u8 as isize);
+        let _ = ptr.offset(offset_usize as isize);
+        //~^ ptr_offset_with_cast
+        let _ = ptr.offset(offset_isize as isize);
+        let _ = ptr.offset(offset_u8 as isize);
 
-        ptr.wrapping_offset(offset_usize as isize);
-        ptr.wrapping_offset(offset_isize as isize);
-        ptr.wrapping_offset(offset_u8 as isize);
+        let _ = ptr.wrapping_offset(offset_usize as isize);
+        //~^ ptr_offset_with_cast
+        let _ = ptr.wrapping_offset(offset_isize as isize);
+        let _ = ptr.wrapping_offset(offset_u8 as isize);
+
+        let _ = S.offset(offset_usize as isize);
+        let _ = S.wrapping_offset(offset_usize as isize);
+
+        let _ = (&ptr).offset(offset_usize as isize);
+        //~^ ptr_offset_with_cast
+        let _ = (&ptr).wrapping_offset(offset_usize as isize);
+        //~^ ptr_offset_with_cast
+    }
+}
+
+#[derive(Clone, Copy)]
+struct S;
+
+impl S {
+    fn offset(self, _: isize) -> Self {
+        self
+    }
+    fn wrapping_offset(self, _: isize) -> Self {
+        self
     }
 }

@@ -2,10 +2,12 @@
     unused_variables,
     unused_assignments,
     clippy::similar_names,
-    clippy::blacklisted_name
+    clippy::disallowed_names,
+    clippy::branches_sharing_code,
+    clippy::needless_late_init
 )]
 #![warn(clippy::useless_let_if_seq)]
-
+//@no-rustfix
 fn f() -> bool {
     true
 }
@@ -33,6 +35,7 @@ fn issue985_alt() -> i32 {
     x
 }
 
+#[allow(clippy::manual_strip)]
 fn issue975() -> String {
     let mut udn = "dummy".to_string();
     if udn.starts_with("uuid:") {
@@ -54,6 +57,17 @@ fn early_return() -> u8 {
     foo
 }
 
+fn allow_works() -> i32 {
+    #[allow(clippy::useless_let_if_seq)]
+    let x;
+    if true {
+        x = 1;
+    } else {
+        x = 2;
+    }
+    x
+}
+
 fn main() {
     early_return();
     issue975();
@@ -61,11 +75,15 @@ fn main() {
     issue985_alt();
 
     let mut foo = 0;
+    //~^ useless_let_if_seq
+
     if f() {
         foo = 42;
     }
 
     let mut bar = 0;
+    //~^ useless_let_if_seq
+
     if f() {
         f();
         bar = 42;
@@ -74,6 +92,8 @@ fn main() {
     }
 
     let quz;
+    //~^ useless_let_if_seq
+
     if f() {
         quz = 42;
     } else {
@@ -103,6 +123,8 @@ fn main() {
 
     // baz needs to be mut
     let mut baz = 0;
+    //~^ useless_let_if_seq
+
     if f() {
         baz = 42;
     }

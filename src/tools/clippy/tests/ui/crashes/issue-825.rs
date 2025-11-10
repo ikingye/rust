@@ -1,8 +1,8 @@
-// run-pass
+//@ check-pass
 
 #![allow(warnings)]
 
-/// Test for https://github.com/rust-lang/rust-clippy/issues/825
+// Test for https://github.com/rust-lang/rust-clippy/issues/825
 
 // this should compile in a reasonable amount of time
 fn rust_type_id(name: &str) {

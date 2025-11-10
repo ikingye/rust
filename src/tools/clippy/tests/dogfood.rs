@@ -1,76 +1,96 @@
-// Dogfood cannot run on Windows
-#![cfg(not(windows))]
+//! This test is a part of quality control and makes clippy eat what it produces. Awesome lints and
+//! long error messages
+//!
+//! See [Eating your own dog food](https://en.wikipedia.org/wiki/Eating_your_own_dog_food) for context
 
-use lazy_static::lazy_static;
+#![warn(rust_2018_idioms, unused_lifetimes)]
+
+use itertools::Itertools;
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::Command;
+use test_utils::IS_RUSTC_TEST_SUITE;
+use ui_test::Args;
 
-mod cargo;
+mod test_utils;
 
-lazy_static! {
-    static ref CLIPPY_PATH: PathBuf = cargo::TARGET_LIB.join("cargo-clippy");
-}
-
-#[test]
-fn dogfood_clippy() {
-    // run clippy on itself and fail the test if lint warnings are reported
-    if cargo::is_rustc_test_suite() {
+fn main() {
+    if IS_RUSTC_TEST_SUITE {
         return;
     }
-    let root_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    let output = Command::new(&*CLIPPY_PATH)
-        .current_dir(root_dir)
-        .env("CLIPPY_DOGFOOD", "1")
-        .env("CARGO_INCREMENTAL", "0")
-        .arg("clippy-preview")
-        .arg("--all-targets")
-        .arg("--all-features")
-        .arg("--")
-        .args(&["-D", "clippy::all"])
-        .args(&["-D", "clippy::internal"])
-        .args(&["-D", "clippy::pedantic"])
-        .arg("-Cdebuginfo=0") // disable debuginfo to generate less data in the target dir
-        .output()
-        .unwrap();
-    println!("status: {}", output.status);
-    println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
-    println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let args = Args::test().unwrap();
 
-    assert!(output.status.success());
+    if args.list {
+        if !args.ignored {
+            println!("dogfood: test");
+        }
+    } else if !args.skip.iter().any(|arg| arg == "dogfood") {
+        dogfood();
+    }
 }
 
-#[test]
-fn dogfood_subprojects() {
-    // run clippy on remaining subprojects and fail the test if lint warnings are reported
-    if cargo::is_rustc_test_suite() {
-        return;
-    }
-    let root_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+fn dogfood() {
+    let mut failed_packages = Vec::new();
 
-    for d in &[
-        "clippy_workspace_tests",
-        "clippy_workspace_tests/src",
-        "clippy_workspace_tests/subcrate",
-        "clippy_workspace_tests/subcrate/src",
+    for package in [
+        "./",
         "clippy_dev",
+        "clippy_lints_internal",
+        "clippy_lints",
+        "clippy_utils",
+        "clippy_config",
+        "declare_clippy_lint",
+        "lintcheck",
         "rustc_tools_util",
     ] {
-        let output = Command::new(&*CLIPPY_PATH)
-            .current_dir(root_dir.join(d))
-            .env("CLIPPY_DOGFOOD", "1")
-            .env("CARGO_INCREMENTAL", "0")
-            .arg("clippy")
-            .arg("--")
-            .args(&["-D", "clippy::all"])
-            .args(&["-D", "clippy::pedantic"])
-            .arg("-Cdebuginfo=0") // disable debuginfo to generate less data in the target dir
-            .output()
-            .unwrap();
-        println!("status: {}", output.status);
-        println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
-        println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
-
-        assert!(output.status.success());
+        println!("linting {package}");
+        if !run_clippy_for_package(package) {
+            failed_packages.push(package);
+        }
     }
+
+    assert!(
+        failed_packages.is_empty(),
+        "Dogfood failed for packages `{}`",
+        failed_packages.iter().join(", "),
+    );
+}
+
+#[must_use]
+fn run_clippy_for_package(project: &str) -> bool {
+    let root_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    let mut command = Command::new(&*test_utils::CARGO_CLIPPY_PATH);
+
+    command
+        .current_dir(root_dir.join(project))
+        .env("CARGO_INCREMENTAL", "0")
+        .arg("clippy")
+        .arg("--all-targets")
+        .arg("--all-features");
+
+    if !io::stdout().is_terminal() {
+        command.arg("-q");
+    }
+
+    if let Ok(dogfood_args) = std::env::var("__CLIPPY_DOGFOOD_ARGS") {
+        for arg in dogfood_args.split_whitespace() {
+            command.arg(arg);
+        }
+    }
+
+    command.arg("--");
+    command.arg("-Cdebuginfo=0"); // disable debuginfo to generate less data in the target dir
+    command.args(["-D", "clippy::all", "-D", "clippy::pedantic", "-D", "clippy::dbg_macro"]);
+    if !cfg!(feature = "internal") {
+        // running a clippy built without internal lints on the clippy source
+        // that contains e.g. `allow(clippy::symbol_as_str)`
+        command.args(["-A", "unknown_lints"]);
+    }
+
+    // Workaround for not being a workspace, add the crate's directory back to the path
+    command.args(["--remap-path-prefix", &format!("={project}")]);
+
+    command.status().unwrap().success()
 }

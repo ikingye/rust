@@ -1,8 +1,8 @@
-error: expected token: `,`
-  --> $DIR/issue-3145.rs:2:19
+error: expected `,`, found `a`
+  --> tests/ui/issue-3145.rs:2:19
    |
-LL |     println!("{}" a); //~ERROR expected token: `,`
+LL |     println!("{}" a);
    |                   ^ expected `,`
 
-error: aborting due to previous error
+error: aborting due to 1 previous error
 

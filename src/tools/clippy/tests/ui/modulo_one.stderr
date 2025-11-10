@@ -1,30 +1,41 @@
 error: any number modulo 1 will be 0
-  --> $DIR/modulo_one.rs:7:5
+  --> tests/ui/modulo_one.rs:9:5
    |
 LL |     10 % 1;
    |     ^^^^^^
    |
    = note: `-D clippy::modulo-one` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::modulo_one)]`
 
-error: the operation is ineffective. Consider reducing it to `1`
-  --> $DIR/modulo_one.rs:10:22
+error: any number modulo -1 will panic/overflow or result in 0
+  --> tests/ui/modulo_one.rs:12:5
    |
-LL |     const ONE: u32 = 1 * 1;
-   |                      ^^^^^
-   |
-   = note: `-D clippy::identity-op` implied by `-D warnings`
+LL |     10 % -1;
+   |     ^^^^^^^
 
-error: the operation is ineffective. Consider reducing it to `1`
-  --> $DIR/modulo_one.rs:10:22
+error: any number modulo -1 will panic/overflow or result in 0
+  --> tests/ui/modulo_one.rs:17:5
    |
-LL |     const ONE: u32 = 1 * 1;
-   |                      ^^^^^
+LL |     i32::MIN % (-1);
+   |     ^^^^^^^^^^^^^^^
 
 error: any number modulo 1 will be 0
-  --> $DIR/modulo_one.rs:12:5
+  --> tests/ui/modulo_one.rs:24:5
    |
 LL |     2 % ONE;
    |     ^^^^^^^
 
-error: aborting due to 4 previous errors
+error: any number modulo -1 will panic/overflow or result in 0
+  --> tests/ui/modulo_one.rs:29:5
+   |
+LL |     2 % NEG_ONE;
+   |     ^^^^^^^^^^^
+
+error: any number modulo -1 will panic/overflow or result in 0
+  --> tests/ui/modulo_one.rs:35:5
+   |
+LL |     INT_MIN % NEG_ONE;
+   |     ^^^^^^^^^^^^^^^^^
+
+error: aborting due to 6 previous errors
 

@@ -1,5 +1,4 @@
-// does not test any rustfixable lints
-
+//@no-rustfix: suggestions have an error margin placeholder
 #![warn(clippy::float_cmp_const)]
 #![allow(clippy::float_cmp)]
 #![allow(unused, clippy::no_effect, clippy::unnecessary_operation)]
@@ -8,25 +7,33 @@ const ONE: f32 = 1.0;
 const TWO: f32 = 2.0;
 
 fn eq_one(x: f32) -> bool {
-    if x.is_nan() {
-        false
-    } else {
-        x == ONE
-    } // no error, inside "eq" fn
+    if x.is_nan() { false } else { x == ONE } // no error, inside "eq" fn
 }
 
 fn main() {
     // has errors
     1f32 == ONE;
+    //~^ float_cmp_const
+
     TWO == ONE;
+    //~^ float_cmp_const
+
     TWO != ONE;
+    //~^ float_cmp_const
+
     ONE + ONE == TWO;
+    //~^ float_cmp_const
+
     let x = 1;
     x as f32 == ONE;
+    //~^ float_cmp_const
 
     let v = 0.9;
     v == ONE;
+    //~^ float_cmp_const
+
     v != ONE;
+    //~^ float_cmp_const
 
     // no errors, lower than or greater than comparisons
     v < ONE;
@@ -48,7 +55,7 @@ fn main() {
     v != 1.0;
 
     const ZERO_ARRAY: [f32; 3] = [0.0, 0.0, 0.0];
-    const ZERO_INF_ARRAY: [f32; 3] = [0.0, ::std::f32::INFINITY, ::std::f32::NEG_INFINITY];
+    const ZERO_INF_ARRAY: [f32; 3] = [0.0, f32::INFINITY, f32::NEG_INFINITY];
     const NON_ZERO_ARRAY: [f32; 3] = [0.0, 0.1, 0.2];
     const NON_ZERO_ARRAY2: [f32; 3] = [0.2, 0.1, 0.0];
 
@@ -59,4 +66,5 @@ fn main() {
 
     // has errors
     NON_ZERO_ARRAY == NON_ZERO_ARRAY2;
+    //~^ float_cmp_const
 }
